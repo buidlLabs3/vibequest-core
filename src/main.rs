@@ -1,22 +1,39 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{env, net::SocketAddr, sync::Arc};
+use serde_json::Value;
+use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
 #[derive(Clone)]
 struct AppState {
+    config: AppConfig,
     openai: OpenAiClient,
+}
+
+#[derive(Clone)]
+struct AppConfig {
+    port: u16,
+    app_env: String,
+    cors_origins: Vec<String>,
+    ckb_rpc_url: Option<String>,
+    fiber_rpc_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -24,14 +41,39 @@ struct OpenAiClient {
     http: Client,
     api_key: Option<String>,
     model: String,
+    base_url: String,
+    timeout: Duration,
 }
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     service: &'static str,
     status: &'static str,
-    ai_layer: &'static str,
+    environment: String,
+    ai_layer: AiLayer,
+    integrations: IntegrationStatus,
     timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyResponse {
+    ready: bool,
+    missing: Vec<&'static str>,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AiLayer {
+    OpenAi,
+    Fallback,
+}
+
+#[derive(Debug, Serialize)]
+struct IntegrationStatus {
+    openai: bool,
+    ckb_rpc: bool,
+    fiber_rpc: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +140,19 @@ struct QuestBlueprint {
 #[derive(Debug, Deserialize)]
 struct OpenAiResponse {
     output_text: Option<String>,
+    output: Option<Vec<OpenAiOutputItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiOutputItem {
+    content: Option<Vec<OpenAiContentItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiContentItem {
+    #[serde(rename = "type")]
+    content_type: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -108,6 +163,11 @@ enum ApiError {
     OpenAi(#[from] reqwest::Error),
     #[error("openai response did not contain valid quest json")]
     InvalidAiResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
 }
 
 #[tokio::main]
@@ -121,32 +181,18 @@ async fn main() {
         )
         .init();
 
-    let port = env::var("PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(8080);
-
+    let config = AppConfig::from_env();
     let state = Arc::new(AppState {
-        openai: OpenAiClient {
-            http: Client::new(),
-            api_key: env::var("OPENAI_API_KEY").ok(),
-            model: env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".to_string()),
-        },
+        openai: OpenAiClient::from_env(),
+        config,
     });
 
     if state.openai.api_key.is_none() {
         warn!("OPENAI_API_KEY is not set; /ai/quests/generate will use fallback quest generation");
     }
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/season", get(season))
-        .route("/ai/quests/generate", post(generate_quest))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let app = build_router(state.clone());
+    let addr = SocketAddr::from(([0, 0, 0, 0], state.config.port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind TCP listener");
@@ -159,17 +205,144 @@ async fn main() {
         .expect("server failed");
 }
 
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/season", get(season))
+        .route("/ai/quests/generate", post(generate_quest))
+        .layer(cors_layer(&state.config))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+fn cors_layer(config: &AppConfig) -> CorsLayer {
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([axum::http::header::CONTENT_TYPE]);
+
+    if config.cors_origins.iter().any(|origin| origin == "*") {
+        return layer.allow_origin(AllowOrigin::any());
+    }
+
+    let origins = config
+        .cors_origins
+        .iter()
+        .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+        .collect::<Vec<_>>();
+
+    layer.allow_origin(origins)
+}
+
+impl AppConfig {
+    fn from_env() -> Self {
+        Self {
+            port: env::var("PORT")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(8080),
+            app_env: env::var("APP_ENV").unwrap_or_else(|_| "development".to_string()),
+            cors_origins: parse_csv_env("CORS_ORIGINS", vec!["http://localhost:3000".to_string()]),
+            ckb_rpc_url: optional_env("CKB_RPC_URL"),
+            fiber_rpc_url: optional_env("FIBER_RPC_URL"),
+        }
+    }
+}
+
+impl OpenAiClient {
+    fn from_env() -> Self {
+        let timeout_seconds = env::var("OPENAI_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(45);
+
+        Self {
+            http: Client::new(),
+            api_key: optional_env("OPENAI_API_KEY"),
+            model: env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string()),
+            base_url: env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            timeout: Duration::from_secs(timeout_seconds),
+        }
+    }
+
+    async fn generate_quest(
+        &self,
+        request: &GenerateQuestRequest,
+    ) -> Result<QuestBlueprint, ApiError> {
+        let Some(api_key) = self.api_key.as_ref() else {
+            return Err(ApiError::InvalidAiResponse);
+        };
+
+        let difficulty = request.difficulty.clone().unwrap_or(Difficulty::Builder);
+        let track = request
+            .skill_track
+            .as_deref()
+            .unwrap_or("CKB + Fiber Builder");
+
+        let prompt = quest_prompt(request.build_prompt.trim(), track, &difficulty);
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": prompt,
+            "text": {
+                "format": quest_json_schema()
+            }
+        });
+
+        let response = self
+            .http
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(api_key)
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<OpenAiResponse>()
+            .await?;
+
+        parse_openai_quest_response(response)
+    }
+}
+
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
         service: "vibequest-core",
         status: "ok",
+        environment: state.config.app_env.clone(),
         ai_layer: if state.openai.api_key.is_some() {
-            "openai"
+            AiLayer::OpenAi
         } else {
-            "fallback"
+            AiLayer::Fallback
         },
+        integrations: integration_status(&state),
         timestamp: Utc::now(),
     })
+}
+
+async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<ReadyResponse>) {
+    let mut missing = Vec::new();
+
+    if state.openai.api_key.is_none() {
+        missing.push("OPENAI_API_KEY");
+    }
+
+    let status = if missing.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(ReadyResponse {
+            ready: missing.is_empty(),
+            missing,
+            timestamp: Utc::now(),
+        }),
+    )
 }
 
 async fn season() -> Json<SeasonResponse> {
@@ -256,23 +429,69 @@ async fn generate_quest(
     }))
 }
 
-impl OpenAiClient {
-    async fn generate_quest(
-        &self,
-        request: &GenerateQuestRequest,
-    ) -> Result<QuestBlueprint, ApiError> {
-        let Some(api_key) = self.api_key.as_ref() else {
-            return Err(ApiError::InvalidAiResponse);
-        };
+fn integration_status(state: &AppState) -> IntegrationStatus {
+    IntegrationStatus {
+        openai: state.openai.api_key.is_some(),
+        ckb_rpc: state.config.ckb_rpc_url.is_some(),
+        fiber_rpc: state.config.fiber_rpc_url.is_some(),
+    }
+}
 
-        let difficulty = request.difficulty.clone().unwrap_or(Difficulty::Builder);
-        let track = request
-            .skill_track
-            .as_deref()
-            .unwrap_or("CKB + Fiber Builder");
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
-        let prompt = format!(
-            r#"You are VibeQuest's quest designer.
+fn parse_csv_env(name: &str, default: Vec<String>) -> Vec<String> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or(default)
+}
+
+fn parse_openai_quest_response(response: OpenAiResponse) -> Result<QuestBlueprint, ApiError> {
+    if let Some(output_text) = response.output_text {
+        return parse_quest_json(&output_text);
+    }
+
+    let text = response
+        .output
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|item| item.content.unwrap_or_default())
+        .filter_map(
+            |content| match (content.content_type.as_deref(), content.text) {
+                (Some("output_text") | Some("text") | None, Some(text)) => Some(text),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if text.trim().is_empty() {
+        return Err(ApiError::InvalidAiResponse);
+    }
+
+    parse_quest_json(&text)
+}
+
+fn parse_quest_json(text: &str) -> Result<QuestBlueprint, ApiError> {
+    serde_json::from_str::<QuestBlueprint>(text.trim()).map_err(|_| ApiError::InvalidAiResponse)
+}
+
+fn quest_prompt(build_prompt: &str, track: &str, difficulty: &Difficulty) -> String {
+    format!(
+        r#"You are VibeQuest's quest designer.
 
 Create one gamified programming quest for a vibecoder who asked the AI to build:
 "{build_prompt}"
@@ -280,46 +499,69 @@ Create one gamified programming quest for a vibecoder who asked the AI to build:
 Skill track: {track}
 Difficulty: {difficulty:?}
 
-Return compact JSON only with this exact shape:
-{{
-  "title": "short quest name",
-  "premise": "one sentence game premise",
-  "build_objective": "what the AI-generated app should build",
-  "comprehension_gates": ["Explain...", "Debug...", "Remix...", "Attack...", "Ship..."],
-  "boss_fight": "final challenge",
-  "reward_logic": "how XP/Fiber/credential rewards unlock",
-  "ckb_fiber_hooks": ["CKB/Fiber integration hook", "another hook"]
-}}
+Make the quest playful, practical, and focused on proving understanding of generated code. The quest must force the learner to explain, debug, test, attack, remix, and ship the generated app. Include CKB proof and Fiber reward hooks when relevant."#
+    )
+}
 
-Make the quest playful, practical, and focused on proving understanding of generated code."#,
-            build_prompt = request.build_prompt.trim()
-        );
-
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": prompt,
-            "text": {
-                "format": {
-                    "type": "json_object"
+fn quest_json_schema() -> Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "name": "vibequest_quest_blueprint",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "title",
+                "premise",
+                "build_objective",
+                "comprehension_gates",
+                "boss_fight",
+                "reward_logic",
+                "ckb_fiber_hooks"
+            ],
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "A short quest name."
+                },
+                "premise": {
+                    "type": "string",
+                    "description": "One sentence game premise."
+                },
+                "build_objective": {
+                    "type": "string",
+                    "description": "What the AI-generated app should build."
+                },
+                "comprehension_gates": {
+                    "type": "array",
+                    "minItems": 5,
+                    "maxItems": 5,
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Exactly five gates: explain, debug, remix, attack, ship."
+                },
+                "boss_fight": {
+                    "type": "string",
+                    "description": "The final challenge before the learner can ship."
+                },
+                "reward_logic": {
+                    "type": "string",
+                    "description": "How XP, Fiber, and credential rewards unlock."
+                },
+                "ckb_fiber_hooks": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "CKB/Fiber integration hooks for the quest."
                 }
             }
-        });
-
-        let response = self
-            .http
-            .post("https://api.openai.com/v1/responses")
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<OpenAiResponse>()
-            .await?;
-
-        let output_text = response.output_text.ok_or(ApiError::InvalidAiResponse)?;
-        serde_json::from_str::<QuestBlueprint>(&output_text)
-            .map_err(|_| ApiError::InvalidAiResponse)
-    }
+        }
+    })
 }
 
 fn fallback_quest(request: &GenerateQuestRequest) -> QuestBlueprint {
@@ -357,11 +599,13 @@ impl IntoResponse for ApiError {
             ApiError::OpenAi(_) | ApiError::InvalidAiResponse => StatusCode::BAD_GATEWAY,
         };
 
-        let body = serde_json::json!({
-            "error": self.to_string(),
-        });
-
-        (status, Json(body)).into_response()
+        (
+            status,
+            Json(ErrorResponse {
+                error: self.to_string(),
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -386,5 +630,92 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_openai_output_text() {
+        let quest = sample_quest();
+        let response = OpenAiResponse {
+            output_text: Some(serde_json::to_string(&quest).unwrap()),
+            output: None,
+        };
+
+        let parsed = parse_openai_quest_response(response).unwrap();
+
+        assert_eq!(parsed.title, "Receipt Raid");
+        assert_eq!(parsed.comprehension_gates.len(), 5);
+    }
+
+    #[test]
+    fn parses_openai_nested_output_text() {
+        let quest = sample_quest();
+        let response = OpenAiResponse {
+            output_text: None,
+            output: Some(vec![OpenAiOutputItem {
+                content: Some(vec![OpenAiContentItem {
+                    content_type: Some("output_text".to_string()),
+                    text: Some(serde_json::to_string(&quest).unwrap()),
+                }]),
+            }]),
+        };
+
+        let parsed = parse_openai_quest_response(response).unwrap();
+
+        assert_eq!(parsed.boss_fight, "Patch the replayable receipt.");
+    }
+
+    #[test]
+    fn fallback_quest_keeps_user_prompt() {
+        let request = GenerateQuestRequest {
+            build_prompt: "Build a Fiber checkout for generated lessons".to_string(),
+            skill_track: Some("Fiber Builder".to_string()),
+            difficulty: Some(Difficulty::Builder),
+        };
+
+        let quest = fallback_quest(&request);
+
+        assert_eq!(
+            quest.build_objective,
+            "Build a Fiber checkout for generated lessons"
+        );
+        assert_eq!(quest.comprehension_gates.len(), 5);
+    }
+
+    #[test]
+    fn schema_requires_expected_fields() {
+        let schema = quest_json_schema();
+        let required = schema
+            .pointer("/schema/required")
+            .and_then(Value::as_array)
+            .unwrap();
+
+        assert!(required.contains(&Value::String("boss_fight".to_string())));
+        assert!(required.contains(&Value::String("ckb_fiber_hooks".to_string())));
+    }
+
+    fn sample_quest() -> QuestBlueprint {
+        QuestBlueprint {
+            title: "Receipt Raid".to_string(),
+            premise: "A generated app claims it can verify every payment.".to_string(),
+            build_objective: "Build a Fiber paywall".to_string(),
+            comprehension_gates: vec![
+                "Explain the verifier.".to_string(),
+                "Debug the unpaid route.".to_string(),
+                "Remix the pricing model.".to_string(),
+                "Attack receipt replay.".to_string(),
+                "Ship with tests.".to_string(),
+            ],
+            boss_fight: "Patch the replayable receipt.".to_string(),
+            reward_logic: "XP per gate, reward after boss.".to_string(),
+            ckb_fiber_hooks: vec![
+                "CKB proof badge.".to_string(),
+                "Fiber bounty payout.".to_string(),
+            ],
+        }
     }
 }
