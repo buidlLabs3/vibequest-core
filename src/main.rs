@@ -18,8 +18,9 @@ use tower_http::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4-mini";
-const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
+const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Xhigh;
 
 #[derive(Clone)]
 struct AppState {
@@ -42,6 +43,8 @@ struct OpenAiClient {
     api_key: Option<String>,
     model: String,
     base_url: String,
+    reasoning_effort: ReasoningEffort,
+    disable_response_storage: bool,
     timeout: Duration,
 }
 
@@ -110,6 +113,17 @@ enum Difficulty {
     Novice,
     Builder,
     Boss,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,16 +268,23 @@ impl OpenAiClient {
         let timeout_seconds = env::var("OPENAI_TIMEOUT_SECONDS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(45);
+            .unwrap_or(90);
 
         Self {
             http: Client::new(),
             api_key: optional_env("OPENAI_API_KEY"),
-            model: env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string()),
+            model: optional_env("OPENAI_MODEL")
+                .or_else(|| optional_env("MODEL"))
+                .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string()),
             base_url: env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string())
                 .trim_end_matches('/')
                 .to_string(),
+            reasoning_effort: optional_env("OPENAI_REASONING_EFFORT")
+                .or_else(|| optional_env("MODEL_REASONING_EFFORT"))
+                .and_then(|value| ReasoningEffort::parse(&value))
+                .unwrap_or(DEFAULT_OPENAI_REASONING_EFFORT),
+            disable_response_storage: parse_bool_env("OPENAI_DISABLE_RESPONSE_STORAGE", true),
             timeout: Duration::from_secs(timeout_seconds),
         }
     }
@@ -286,6 +307,10 @@ impl OpenAiClient {
         let body = serde_json::json!({
             "model": self.model,
             "input": prompt,
+            "reasoning": {
+                "effort": self.reasoning_effort
+            },
+            "store": !self.disable_response_storage,
             "text": {
                 "format": quest_json_schema()
             }
@@ -304,6 +329,20 @@ impl OpenAiClient {
             .await?;
 
         parse_openai_quest_response(response)
+    }
+}
+
+impl ReasoningEffort {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            _ => None,
+        }
     }
 }
 
@@ -456,6 +495,16 @@ fn parse_csv_env(name: &str, default: Vec<String>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .filter(|values| !values.is_empty())
+        .unwrap_or(default)
+}
+
+fn parse_bool_env(name: &str, default: bool) -> bool {
+    optional_env(name)
+        .and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        })
         .unwrap_or(default)
 }
 
@@ -696,6 +745,19 @@ mod tests {
 
         assert!(required.contains(&Value::String("boss_fight".to_string())));
         assert!(required.contains(&Value::String("ckb_fiber_hooks".to_string())));
+    }
+
+    #[test]
+    fn parses_provider_config_values() {
+        assert_eq!(
+            ReasoningEffort::parse("xhigh"),
+            Some(ReasoningEffort::Xhigh)
+        );
+        assert_eq!(
+            ReasoningEffort::parse(" HIGH "),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(ReasoningEffort::parse("maximum"), None);
     }
 
     fn sample_quest() -> QuestBlueprint {

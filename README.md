@@ -9,7 +9,7 @@ cp .env.example .env
 cargo run
 ```
 
-Without `OPENAI_API_KEY`, `/ai/quests/generate` returns a deterministic fallback quest so local demos still work. Set `OPENAI_API_KEY` to enable the OpenAI Responses API path.
+Without `OPENAI_API_KEY`, `/ai/quests/generate` returns a deterministic fallback quest so local demos still work. Set `OPENAI_API_KEY` to enable the OpenAI-compatible Responses API path.
 
 ## Environment
 
@@ -19,9 +19,11 @@ Without `OPENAI_API_KEY`, `/ai/quests/generate` returns a deterministic fallback
 | `PORT` | No | `8080` | HTTP server port. |
 | `CORS_ORIGINS` | No | `http://localhost:3000` | Comma-separated frontend origins. Use `*` only for throwaway demos. |
 | `OPENAI_API_KEY` | For AI | empty | Enables OpenAI quest generation. |
-| `OPENAI_MODEL` | No | `gpt-5.4-mini` | OpenAI model for quest generation. |
-| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | Override for compatible gateways. |
-| `OPENAI_TIMEOUT_SECONDS` | No | `45` | Request timeout for OpenAI calls. |
+| `OPENAI_MODEL` | No | `gpt-5.5` | OpenAI model for quest generation. |
+| `OPENAI_BASE_URL` | No | `https://share-ai.ckbdev.com` | OpenAI-compatible Responses API gateway. |
+| `OPENAI_REASONING_EFFORT` | No | `xhigh` | Reasoning effort sent as `reasoning.effort`. |
+| `OPENAI_DISABLE_RESPONSE_STORAGE` | No | `true` | Sends `store: false` to avoid retaining generated responses. |
+| `OPENAI_TIMEOUT_SECONDS` | No | `90` | Request timeout for OpenAI calls. |
 | `CKB_RPC_URL` | Later | empty | Planned CKB proof adapter endpoint. |
 | `FIBER_RPC_URL` | Later | empty | Planned Fiber reward adapter endpoint. |
 

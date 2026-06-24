@@ -1,1 +1,6 @@
 /target
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
