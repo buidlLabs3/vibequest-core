@@ -607,7 +607,7 @@ fn is_ckb_secp256k1_sign_type(sign_type: &str) -> bool {
         .flat_map(char::to_lowercase)
         .collect();
 
-    normalized == "ckbsecp256k1" || normalized.ends_with("ckbsecp256k1")
+    matches!(normalized.as_str(), "ckbsecp256k1" | "signersigntypeckbsecp256k1")
 }
 
 fn verify_ckb_wallet_signature(wallet: &WalletProof) -> Result<(), ApiError> {
@@ -1013,6 +1013,7 @@ mod tests {
             "SignerSignType.CkbSecp256k1",
             "ckb_secp256k1",
             "ckb-secp256k1",
+            "SignerSignType::CkbSecp256k1",
         ] {
             let mut wallet = signed_wallet_fixture();
             wallet.signature.sign_type = sign_type.to_string();
