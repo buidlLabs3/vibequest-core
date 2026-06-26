@@ -599,8 +599,19 @@ fn validate_wallet_proof(wallet: &WalletProof) -> Result<(), ApiError> {
     verify_ckb_wallet_signature(wallet)
 }
 
+fn is_ckb_secp256k1_sign_type(sign_type: &str) -> bool {
+    let normalized: String = sign_type
+        .trim()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+
+    normalized == "ckbsecp256k1" || normalized.ends_with("ckbsecp256k1")
+}
+
 fn verify_ckb_wallet_signature(wallet: &WalletProof) -> Result<(), ApiError> {
-    if wallet.signature.sign_type.trim() != "CkbSecp256k1" {
+    if !is_ckb_secp256k1_sign_type(&wallet.signature.sign_type) {
         return Err(ApiError::UnsupportedWalletSignature);
     }
 
@@ -995,6 +1006,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn wallet_proof_accepts_connector_sign_type_variants() {
+        for sign_type in [
+            "CkbSecp256k1",
+            "SignerSignType.CkbSecp256k1",
+            "ckb_secp256k1",
+            "ckb-secp256k1",
+        ] {
+            let mut wallet = signed_wallet_fixture();
+            wallet.signature.sign_type = sign_type.to_string();
+
+            validate_wallet_proof(&wallet).unwrap();
+        }
+    }
+
+    #[test]
+    fn wallet_proof_rejects_non_ckb_sign_type() {
+        let mut wallet = signed_wallet_fixture();
+        wallet.signature.sign_type = "EthereumPersonalSign".to_string();
+
+        assert!(matches!(
+            validate_wallet_proof(&wallet),
+            Err(ApiError::UnsupportedWalletSignature)
+        ));
+    }
     #[test]
     fn wallet_proof_rejects_tampered_signature_message() {
         let wallet = WalletProof {
