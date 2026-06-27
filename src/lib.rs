@@ -1,17 +1,23 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use futures_util::TryStreamExt;
+use mongodb::{
+    Client as MongoClient, Collection, Database,
+    bson::{DateTime as BsonDateTime, Document, doc},
+};
 use reqwest::{Client, StatusCode as ReqwestStatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{env, error::Error, sync::Arc, time::Duration};
 use thiserror::Error;
+use tokio::sync::OnceCell;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -28,6 +34,7 @@ const SERVERLESS_OPENAI_TIMEOUT_SECONDS: u64 = 50;
 pub struct AppState {
     config: AppConfig,
     openai: OpenAiClient,
+    store: MongoStore,
 }
 
 #[derive(Clone)]
@@ -37,6 +44,8 @@ struct AppConfig {
     cors_origins: Vec<String>,
     ckb_rpc_url: Option<String>,
     fiber_rpc_url: Option<String>,
+    mongodb_uri: Option<String>,
+    mongodb_database: String,
 }
 
 #[derive(Clone)]
@@ -79,6 +88,7 @@ struct IntegrationStatus {
     openai: bool,
     ckb_rpc: bool,
     fiber_rpc: bool,
+    mongodb: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,14 +162,14 @@ struct GenerateQuestResponse {
     ship_requirements: ShipRequirements,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum QuestSource {
     OpenAi,
     CoreFallback,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct WalletBinding {
     address: String,
     identity: String,
@@ -167,14 +177,14 @@ struct WalletBinding {
     message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ShipRequirements {
     ckb_rpc_ready: bool,
     fiber_rpc_ready: bool,
     can_claim_rewards: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct QuestBlueprint {
     title: String,
     premise: String,
@@ -186,7 +196,7 @@ struct QuestBlueprint {
     workbench_files: Vec<WorkbenchFile>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct WorkbenchFile {
     path: String,
     language: String,
@@ -236,6 +246,14 @@ enum ApiError {
     },
     #[error("openai response did not contain valid quest json")]
     InvalidAiResponse,
+    #[error("MongoDB is not configured on vibequest-core")]
+    DatabaseUnavailable,
+    #[error("database operation failed: {0}")]
+    Database(String),
+    #[error("quest run was not found")]
+    QuestNotFound,
+    #[error("wallet proof does not own this quest run")]
+    WalletMismatch,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,12 +261,465 @@ struct ErrorResponse {
     error: String,
 }
 
+impl From<mongodb::error::Error> for ApiError {
+    fn from(error: mongodb::error::Error) -> Self {
+        Self::Database(error.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct MongoStore {
+    uri: Option<String>,
+    database_name: String,
+    client: Arc<OnceCell<MongoClient>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct UserDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    address: String,
+    wallet: WalletBinding,
+    quest_counts: UserQuestCounts,
+    created_at: BsonDateTime,
+    updated_at: BsonDateTime,
+    last_seen_at: BsonDateTime,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct UserQuestCounts {
+    created: i64,
+    completed: i64,
+    uncompleted: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct QuestRunDocument {
+    #[serde(rename = "_id")]
+    run_id: String,
+    user_address: String,
+    build_prompt: String,
+    skill_track: String,
+    difficulty: String,
+    source: QuestSource,
+    wallet: WalletBinding,
+    quest: QuestBlueprint,
+    ship_requirements: ShipRequirements,
+    progress: QuestProgress,
+    status: QuestRunStatus,
+    created_at: BsonDateTime,
+    updated_at: BsonDateTime,
+    completed_at: Option<BsonDateTime>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct QuestProgress {
+    gates: Vec<StoredGateProgress>,
+    boss_fight_solved: bool,
+    shipped: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredGateProgress {
+    id: String,
+    name: String,
+    description: String,
+    #[serde(alias = "isCompleted")]
+    is_completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum QuestRunStatus {
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Serialize)]
+struct UserQuestHistoryResponse {
+    user: Option<UserProfileResponse>,
+    stats: UserQuestCounts,
+    active_run: Option<QuestRunRecord>,
+    runs: Vec<QuestRunRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct UserProfileResponse {
+    address: String,
+    quest_counts: UserQuestCounts,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct QuestRunRecord {
+    run_id: String,
+    user_address: String,
+    build_prompt: String,
+    skill_track: String,
+    difficulty: String,
+    source: QuestSource,
+    quest: QuestBlueprint,
+    ship_requirements: ShipRequirements,
+    progress: QuestProgress,
+    status: QuestRunStatus,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateQuestProgressRequest {
+    wallet: WalletProof,
+    gates: Option<Vec<StoredGateProgress>>,
+    boss_fight_solved: Option<bool>,
+    shipped: Option<bool>,
+}
+
+impl MongoStore {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            uri: config.mongodb_uri.clone(),
+            database_name: config.mongodb_database.clone(),
+            client: Arc::new(OnceCell::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            uri: None,
+            database_name: "vibequest".to_string(),
+            client: Arc::new(OnceCell::new()),
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        self.uri.is_some()
+    }
+
+    async fn database(&self) -> Result<Database, ApiError> {
+        let uri = self.uri.clone().ok_or(ApiError::DatabaseUnavailable)?;
+        let client = self
+            .client
+            .get_or_try_init(move || async move {
+                MongoClient::with_uri_str(&uri)
+                    .await
+                    .map_err(|error| ApiError::Database(error.to_string()))
+            })
+            .await?;
+
+        Ok(client.database(&self.database_name))
+    }
+
+    async fn users(&self) -> Result<Collection<UserDocument>, ApiError> {
+        Ok(self.database().await?.collection("users"))
+    }
+
+    async fn quest_runs(&self) -> Result<Collection<QuestRunDocument>, ApiError> {
+        Ok(self.database().await?.collection("quest_runs"))
+    }
+
+    async fn record_generated_quest(
+        &self,
+        request: &GenerateQuestRequest,
+        response: &GenerateQuestResponse,
+    ) -> Result<(), ApiError> {
+        if !self.is_configured() {
+            return Ok(());
+        }
+
+        self.upsert_user(&response.wallet).await?;
+
+        let now = BsonDateTime::now();
+        let run = QuestRunDocument {
+            run_id: response.run_id.to_string(),
+            user_address: response.wallet.address.clone(),
+            build_prompt: request.build_prompt.trim().to_string(),
+            skill_track: request
+                .skill_track
+                .as_deref()
+                .unwrap_or("CKB + Fiber Builder")
+                .trim()
+                .to_string(),
+            difficulty: difficulty_label(request.difficulty.as_ref()).to_string(),
+            source: response.source,
+            wallet: response.wallet.clone(),
+            quest: response.quest.clone(),
+            ship_requirements: response.ship_requirements.clone(),
+            progress: initial_quest_progress(
+                response.ship_requirements.ckb_rpc_ready
+                    && response.ship_requirements.fiber_rpc_ready,
+            ),
+            status: QuestRunStatus::InProgress,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+
+        self.quest_runs().await?.insert_one(&run).await?;
+        self.refresh_user_counts(&response.wallet.address).await?;
+        Ok(())
+    }
+
+    async fn upsert_user(&self, wallet: &WalletBinding) -> Result<(), ApiError> {
+        let users = self.users().await?;
+        let address = wallet.address.trim().to_string();
+        let now = BsonDateTime::now();
+
+        if users.find_one(doc! { "_id": &address }).await?.is_some() {
+            users
+                .update_one(
+                    doc! { "_id": &address },
+                    doc! {
+                        "$set": {
+                            "address": &address,
+                            "wallet": wallet_document(wallet),
+                            "updated_at": now,
+                            "last_seen_at": now,
+                        }
+                    },
+                )
+                .await?;
+            return Ok(());
+        }
+
+        users
+            .insert_one(UserDocument {
+                id: address.clone(),
+                address,
+                wallet: wallet.clone(),
+                quest_counts: UserQuestCounts::default(),
+                created_at: now,
+                updated_at: now,
+                last_seen_at: now,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn user_history(&self, address: &str) -> Result<UserQuestHistoryResponse, ApiError> {
+        let address = address.trim();
+        if address.is_empty() {
+            return Err(ApiError::MissingWalletAddress);
+        }
+
+        let users = self.users().await?;
+        let runs = self.quest_runs().await?;
+        let user = users.find_one(doc! { "_id": address }).await?;
+        let stats = self.counts_for_user(address).await?;
+        let cursor = runs
+            .find(doc! { "user_address": address })
+            .sort(doc! { "updated_at": -1 })
+            .limit(40)
+            .await?;
+        let documents = cursor.try_collect::<Vec<_>>().await?;
+        let records = documents
+            .into_iter()
+            .map(QuestRunRecord::from)
+            .collect::<Vec<_>>();
+        let active_run = records
+            .iter()
+            .find(|run| run.status != QuestRunStatus::Completed)
+            .cloned()
+            .or_else(|| records.first().cloned());
+
+        Ok(UserQuestHistoryResponse {
+            user: user.map(UserProfileResponse::from),
+            stats,
+            active_run,
+            runs: records,
+        })
+    }
+
+    async fn get_run(&self, run_id: &str) -> Result<QuestRunDocument, ApiError> {
+        self.quest_runs()
+            .await?
+            .find_one(doc! { "_id": run_id })
+            .await?
+            .ok_or(ApiError::QuestNotFound)
+    }
+
+    async fn update_progress(
+        &self,
+        run_id: &str,
+        request: UpdateQuestProgressRequest,
+    ) -> Result<QuestRunRecord, ApiError> {
+        validate_wallet_proof(&request.wallet)?;
+
+        let mut run = self.get_run(run_id).await?;
+        if run.user_address != request.wallet.address.trim() {
+            return Err(ApiError::WalletMismatch);
+        }
+
+        if let Some(gates) = request.gates {
+            run.progress.gates = gates;
+        }
+        if let Some(boss_fight_solved) = request.boss_fight_solved {
+            run.progress.boss_fight_solved = boss_fight_solved;
+        }
+        if let Some(shipped) = request.shipped {
+            run.progress.shipped = shipped;
+        }
+
+        run.status = status_for_progress(&run.progress);
+        run.updated_at = BsonDateTime::now();
+        if run.status == QuestRunStatus::Completed && run.completed_at.is_none() {
+            run.completed_at = Some(run.updated_at);
+        }
+        if run.status != QuestRunStatus::Completed {
+            run.completed_at = None;
+        }
+
+        self.quest_runs()
+            .await?
+            .replace_one(doc! { "_id": run_id }, &run)
+            .await?;
+        self.refresh_user_counts(&run.user_address).await?;
+
+        Ok(run.into())
+    }
+
+    async fn counts_for_user(&self, address: &str) -> Result<UserQuestCounts, ApiError> {
+        let runs = self.quest_runs().await?;
+        let created = runs
+            .count_documents(doc! { "user_address": address })
+            .await? as i64;
+        let completed = runs
+            .count_documents(doc! { "user_address": address, "status": "completed" })
+            .await? as i64;
+
+        Ok(UserQuestCounts {
+            created,
+            completed,
+            uncompleted: created.saturating_sub(completed),
+        })
+    }
+
+    async fn refresh_user_counts(&self, address: &str) -> Result<(), ApiError> {
+        let counts = self.counts_for_user(address).await?;
+        self.users()
+            .await?
+            .update_one(
+                doc! { "_id": address },
+                doc! {
+                    "$set": {
+                        "quest_counts.created": counts.created,
+                        "quest_counts.completed": counts.completed,
+                        "quest_counts.uncompleted": counts.uncompleted,
+                        "updated_at": BsonDateTime::now(),
+                    }
+                },
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+impl From<UserDocument> for UserProfileResponse {
+    fn from(user: UserDocument) -> Self {
+        Self {
+            address: user.address,
+            quest_counts: user.quest_counts,
+            created_at: bson_datetime_to_utc(user.created_at),
+            updated_at: bson_datetime_to_utc(user.updated_at),
+            last_seen_at: bson_datetime_to_utc(user.last_seen_at),
+        }
+    }
+}
+
+impl From<QuestRunDocument> for QuestRunRecord {
+    fn from(run: QuestRunDocument) -> Self {
+        Self {
+            run_id: run.run_id,
+            user_address: run.user_address,
+            build_prompt: run.build_prompt,
+            skill_track: run.skill_track,
+            difficulty: run.difficulty,
+            source: run.source,
+            quest: run.quest,
+            ship_requirements: run.ship_requirements,
+            progress: run.progress,
+            status: run.status,
+            created_at: bson_datetime_to_utc(run.created_at),
+            updated_at: bson_datetime_to_utc(run.updated_at),
+            completed_at: run.completed_at.map(bson_datetime_to_utc),
+        }
+    }
+}
+
+fn initial_quest_progress(infrastructure_ready: bool) -> QuestProgress {
+    QuestProgress {
+        gates: vec![
+            StoredGateProgress {
+                id: "identity".to_string(),
+                name: "Wallet Proof".to_string(),
+                description: "A signed JoyID passkey proof is bound to this quest session."
+                    .to_string(),
+                is_completed: true,
+            },
+            StoredGateProgress {
+                id: "infrastructure".to_string(),
+                name: "Backend Readiness".to_string(),
+                description:
+                    "vibequest-core reports OpenAI, CKB RPC, Fiber RPC, and MongoDB ready."
+                        .to_string(),
+                is_completed: infrastructure_ready,
+            },
+            StoredGateProgress {
+                id: "verification".to_string(),
+                name: "Generated Workspace Checks".to_string(),
+                description: "Generated files pass proof, test, and denial-path checks."
+                    .to_string(),
+                is_completed: false,
+            },
+        ],
+        boss_fight_solved: false,
+        shipped: false,
+    }
+}
+
+fn status_for_progress(progress: &QuestProgress) -> QuestRunStatus {
+    if progress.shipped
+        && progress.boss_fight_solved
+        && progress.gates.iter().all(|gate| gate.is_completed)
+    {
+        QuestRunStatus::Completed
+    } else {
+        QuestRunStatus::InProgress
+    }
+}
+
+fn wallet_document(wallet: &WalletBinding) -> Document {
+    doc! {
+        "address": &wallet.address,
+        "identity": &wallet.identity,
+        "sign_type": &wallet.sign_type,
+        "message": &wallet.message,
+    }
+}
+
+fn bson_datetime_to_utc(value: BsonDateTime) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_millis(value.timestamp_millis()).unwrap_or_else(Utc::now)
+}
+
+fn difficulty_label(difficulty: Option<&Difficulty>) -> &'static str {
+    match difficulty {
+        Some(Difficulty::Novice) => "novice",
+        Some(Difficulty::Boss) => "boss",
+        _ => "builder",
+    }
+}
+
 pub fn app_state() -> Arc<AppState> {
     dotenvy::dotenv().ok();
 
     let config = AppConfig::from_env();
+    let store = MongoStore::from_config(&config);
     let state = Arc::new(AppState {
         openai: OpenAiClient::from_env(),
+        store,
         config,
     });
 
@@ -266,6 +737,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/season", get(season))
+        .route("/users/{address}/quests", get(list_user_quests))
+        .route("/quests/{run_id}", get(get_quest_run))
+        .route("/quests/{run_id}/progress", post(update_quest_progress))
         .route("/ai/quests/generate", post(generate_quest))
         .layer(cors_layer(&state.config))
         .layer(TraceLayer::new_for_http())
@@ -301,6 +775,9 @@ impl AppConfig {
             cors_origins: parse_csv_env("CORS_ORIGINS", vec!["http://localhost:3000".to_string()]),
             ckb_rpc_url: optional_env("CKB_RPC_URL"),
             fiber_rpc_url: optional_env("FIBER_RPC_URL"),
+            mongodb_uri: optional_env("MONGODB_URI"),
+            mongodb_database: optional_env("MONGODB_DATABASE")
+                .unwrap_or_else(|| "vibequest".to_string()),
         }
     }
 }
@@ -536,7 +1013,7 @@ async fn generate_quest(
         Err(error) => return Err(error),
     };
 
-    Ok(Json(GenerateQuestResponse {
+    let response = GenerateQuestResponse {
         run_id,
         source,
         wallet: WalletBinding {
@@ -552,7 +1029,36 @@ async fn generate_quest(
             can_claim_rewards: state.config.ckb_rpc_url.is_some()
                 && state.config.fiber_rpc_url.is_some(),
         },
-    }))
+    };
+
+    state
+        .store
+        .record_generated_quest(&request, &response)
+        .await?;
+
+    Ok(Json(response))
+}
+
+async fn list_user_quests(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> Result<Json<UserQuestHistoryResponse>, ApiError> {
+    Ok(Json(state.store.user_history(&address).await?))
+}
+
+async fn get_quest_run(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<QuestRunRecord>, ApiError> {
+    Ok(Json(state.store.get_run(&run_id).await?.into()))
+}
+
+async fn update_quest_progress(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Json(request): Json<UpdateQuestProgressRequest>,
+) -> Result<Json<QuestRunRecord>, ApiError> {
+    Ok(Json(state.store.update_progress(&run_id, request).await?))
 }
 
 fn integration_status(state: &AppState) -> IntegrationStatus {
@@ -560,6 +1066,7 @@ fn integration_status(state: &AppState) -> IntegrationStatus {
         openai: state.openai.api_key.is_some(),
         ckb_rpc: state.config.ckb_rpc_url.is_some(),
         fiber_rpc: state.config.fiber_rpc_url.is_some(),
+        mongodb: state.store.is_configured(),
     }
 }
 
@@ -576,6 +1083,10 @@ fn missing_integrations(state: &AppState) -> Vec<&'static str> {
 
     if state.config.fiber_rpc_url.is_none() {
         missing.push("FIBER_RPC_URL");
+    }
+
+    if !state.store.is_configured() {
+        missing.push("MONGODB_URI");
     }
 
     missing
@@ -679,7 +1190,7 @@ fn is_hex_public_key(value: &str) -> bool {
     let trimmed = value.trim().trim_start_matches("0x");
 
     !trimmed.is_empty()
-        && trimmed.len() % 2 == 0
+        && trimmed.len().is_multiple_of(2)
         && trimmed
             .chars()
             .all(|character| character.is_ascii_hexdigit())
@@ -1002,10 +1513,15 @@ impl IntoResponse for ApiError {
             | ApiError::InvalidWalletProofMessage
             | ApiError::UnsupportedWalletSignature
             | ApiError::InvalidWalletSignature => StatusCode::BAD_REQUEST,
-            ApiError::MissingOpenAiKey => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::MissingOpenAiKey | ApiError::DatabaseUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            ApiError::QuestNotFound => StatusCode::NOT_FOUND,
+            ApiError::WalletMismatch => StatusCode::FORBIDDEN,
             ApiError::OpenAiTransport(_)
             | ApiError::OpenAiStatus { .. }
             | ApiError::InvalidAiResponse => StatusCode::BAD_GATEWAY,
+            ApiError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         (
@@ -1217,6 +1733,8 @@ mod tests {
                 cors_origins: vec!["http://localhost:3000".to_string()],
                 ckb_rpc_url: None,
                 fiber_rpc_url: None,
+                mongodb_uri: None,
+                mongodb_database: "vibequest".to_string(),
             },
             openai: OpenAiClient {
                 http: Client::new(),
@@ -1227,11 +1745,12 @@ mod tests {
                 disable_response_storage: true,
                 timeout: Duration::from_secs(1),
             },
+            store: MongoStore::disabled(),
         };
 
         assert_eq!(
             missing_integrations(&state),
-            vec!["CKB_RPC_URL", "FIBER_RPC_URL"]
+            vec!["CKB_RPC_URL", "FIBER_RPC_URL", "MONGODB_URI"]
         );
     }
 

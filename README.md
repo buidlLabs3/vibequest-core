@@ -9,7 +9,7 @@ cp .env.example .env
 cargo run
 ```
 
-`/ai/quests/generate` requires `OPENAI_API_KEY` and a verified CKB `CkbSecp256k1` wallet proof. `/ready` returns `503` until OpenAI, CKB RPC, and Fiber RPC are configured.
+`/ai/quests/generate` requires `OPENAI_API_KEY`, `MONGODB_URI`, and a verified JoyID wallet proof. `/ready` returns `503` until OpenAI, CKB RPC, Fiber RPC, and MongoDB are configured.
 
 ## Environment
 
@@ -26,13 +26,18 @@ cargo run
 | `OPENAI_TIMEOUT_SECONDS` | No | `180` | Request timeout for slower high-reasoning OpenAI calls. |
 | `CKB_RPC_URL` | Yes | empty | CKB RPC endpoint used by proof receipt and reward-claim readiness gates. |
 | `FIBER_RPC_URL` | Yes | empty | Fiber RPC endpoint used by payment, hint fee, and reward-claim readiness gates. Use a public endpoint for cloud deploys. |
+| `MONGODB_URI` | Yes | empty | MongoDB Atlas connection string for users, quest runs, progress, and ship state. |
+| `MONGODB_DATABASE` | No | `vibequest` | Database name used by the persistence layer. |
 
 ## Endpoints
 
 - `GET /health` - service status, integration readiness, and missing configuration.
 - `GET /ready` - production readiness check; returns `503` until OpenAI, CKB RPC, and Fiber RPC are configured.
 - `GET /season` - Season 0 tracks, gates, and product thesis.
-- `POST /ai/quests/generate` - verifies a CKB wallet proof, then turns a vibecoding prompt into a structured quest.
+- `GET /users/{address}/quests` - returns the wallet profile, created/completed/uncompleted counts, active run, and recent quest history.
+- `GET /quests/{run_id}` - returns one persisted quest run.
+- `POST /quests/{run_id}/progress` - verifies the JoyID wallet proof, then saves gate, boss, and shipping progress.
+- `POST /ai/quests/generate` - verifies a JoyID wallet proof, generates a quest, and stores it as a MongoDB quest run.
 
 Example:
 
@@ -49,7 +54,7 @@ curl -X POST http://localhost:8080/ai/quests/generate \
       "signature": {
         "signature": "0x...",
         "identity": "0x...",
-        "sign_type": "CkbSecp256k1"
+        "sign_type": "JoyId"
       }
     }
   }'
@@ -78,6 +83,8 @@ vercel env add OPENAI_DISABLE_RESPONSE_STORAGE production
 vercel env add OPENAI_TIMEOUT_SECONDS production
 vercel env add CKB_RPC_URL production
 vercel env add FIBER_RPC_URL production
+vercel env add MONGODB_URI production
+vercel env add MONGODB_DATABASE production
 vercel --prod
 ```
 
@@ -93,6 +100,7 @@ docker run --rm -p 8080:8080 --env-file .env vibequest-core
 ## Runtime Modules
 
 - OpenAI orchestration for quest design, code explanation, and challenge generation.
+- MongoDB persistence for users, created quests, uncompleted quests, completed quests, gate progress, boss state, and ship envelopes.
 - Test-runner workers for debug and no-prompt zones.
 - CKB proof adapter for badges, receipts, and skill passport history.
 - Fiber reward adapter for hints, bounties, prizes, and creator royalties.
