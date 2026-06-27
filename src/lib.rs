@@ -27,8 +27,9 @@ use uuid::Uuid;
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
-const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
-const SERVERLESS_OPENAI_TIMEOUT_SECONDS: u64 = 50;
+const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Minimal;
+const SERVERLESS_OPENAI_TIMEOUT_SECONDS: u64 = 12;
+const QUICK_QUEST_OUTPUT_TOKENS: u16 = 900;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1149,7 +1150,7 @@ impl OpenAiClient {
         let timeout_seconds = env::var("OPENAI_TIMEOUT_SECONDS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(180);
+            .unwrap_or(SERVERLESS_OPENAI_TIMEOUT_SECONDS);
 
         Self {
             http: Client::new(),
@@ -1191,7 +1192,7 @@ impl OpenAiClient {
             "reasoning": {
                 "effort": self.reasoning_effort.serverless_safe()
             },
-            "max_output_tokens": 2200,
+            "max_output_tokens": QUICK_QUEST_OUTPUT_TOKENS,
             "store": !self.disable_response_storage,
             "text": {
                 "format": quest_json_schema()
@@ -1350,7 +1351,7 @@ impl ReasoningEffort {
 
     fn serverless_safe(self) -> Self {
         match self {
-            Self::High | Self::Xhigh => Self::Low,
+            Self::High | Self::Xhigh | Self::Medium | Self::Low => Self::Minimal,
             value => value,
         }
     }
@@ -1457,8 +1458,14 @@ async fn generate_quest(
 
     let run_id = Uuid::new_v4();
     let (source, quest) = match state.openai.generate_quest(&request).await {
-        Ok(quest) => (QuestSource::OpenAi, quest),
-        Err(ApiError::OpenAiTransport(_)) => (
+        Ok(quest) => (
+            QuestSource::OpenAi,
+            compact_quest_blueprint(quest, &request, run_id),
+        ),
+        Err(ApiError::MissingOpenAiKey)
+        | Err(ApiError::OpenAiTransport(_))
+        | Err(ApiError::OpenAiStatus { .. })
+        | Err(ApiError::InvalidAiResponse) => (
             QuestSource::CoreFallback,
             fallback_quest_blueprint(&request, run_id),
         ),
@@ -1746,6 +1753,49 @@ fn truncate_error_body(body: &str) -> String {
     truncated
 }
 
+fn compact_quest_blueprint(
+    mut quest: QuestBlueprint,
+    request: &GenerateQuestRequest,
+    run_id: Uuid,
+) -> QuestBlueprint {
+    if quest.comprehension_gates.len() > 3 {
+        quest.comprehension_gates.truncate(3);
+    }
+    while quest.comprehension_gates.len() < 3 {
+        quest.comprehension_gates.push(
+            "Explain the trust boundary, run the denial test, then ship the badge.".to_string(),
+        );
+    }
+
+    if quest.ckb_fiber_hooks.len() > 2 {
+        quest.ckb_fiber_hooks.truncate(2);
+    }
+    if quest.workbench_files.len() > 2 {
+        quest.workbench_files.truncate(2);
+    }
+
+    for file in &mut quest.workbench_files {
+        file.content = compact_file_content(&file.content, 80);
+    }
+
+    if quest.workbench_files.is_empty() {
+        quest = fallback_quest_blueprint(request, run_id);
+    }
+
+    quest
+}
+
+fn compact_file_content(content: &str, max_lines: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.len() <= max_lines {
+        return content.to_string();
+    }
+
+    let mut compacted = lines[..max_lines].join("\n");
+    compacted.push_str("\n// VibeQuest clipped this file to keep the browser workbench fast.\n");
+    compacted
+}
+
 fn fallback_quest_blueprint(request: &GenerateQuestRequest, run_id: Uuid) -> QuestBlueprint {
     let track = request
         .skill_track
@@ -1758,21 +1808,18 @@ fn fallback_quest_blueprint(request: &GenerateQuestRequest, run_id: Uuid) -> Que
 
     QuestBlueprint {
         title: format!("{} Proof Run", track.replace(" Builder", "")),
-        premise: "The AI gateway stalled, so VibeQuest Core compiled a deterministic CKB/Fiber quest you can still inspect, test, and defend.".to_string(),
+        premise: "VibeQuest compiled a quick CKB/Fiber badge quest you can inspect, verify, and ship without waiting on a long AI response.".to_string(),
         build_objective: objective.to_string(),
         comprehension_gates: vec![
-            "Explain what the receipt verifier trusts from JoyID, CKB proof data, and Fiber payment state.".to_string(),
-            "Debug the unpaid-read denial path so a missing receipt cannot unlock protected content.".to_string(),
-            "Remix the payout split to support a creator, sponsor, and protocol fee recipient.".to_string(),
-            "Attack the proof flow by describing a replay attempt and the nonce/run binding that blocks it.".to_string(),
-            "Ship only after the generated test passes and the boss answer proves you understand the diff.".to_string(),
+            "Explain what the verifier trusts from JoyID, CKB proof hash, and Fiber receipt state.".to_string(),
+            "Verify that unpaid reads and replayed receipts are rejected by the test file.".to_string(),
+            "Ship the success badge after the checks pass and the boss answer proves understanding.".to_string(),
         ],
         boss_fight: "A user tries to reuse a valid Fiber receipt from another run. Identify the missing binding and patch the verifier so receipts are scoped to the active VibeQuest run.".to_string(),
         reward_logic: "XP unlocks per comprehension gate. Fiber rewards and the CKB proof badge unlock only after the denial-path test and boss challenge pass.".to_string(),
         ckb_fiber_hooks: vec![
-            "CKB stores the quest receipt hash, JoyID proof digest, and ship badge metadata.".to_string(),
-            "Fiber handles instant hint fees, sponsor rewards, and creator payout settlement.".to_string(),
-            "The run nonce binds receipts to this generated workspace so replayed proofs fail.".to_string(),
+            "CKB stores the quest receipt hash, JoyID proof digest, and success badge metadata.".to_string(),
+            "Fiber reward claims stay invoice-bound after the learner ships the badge.".to_string(),
         ],
         workbench_files: vec![
             WorkbenchFile {
@@ -1841,13 +1888,6 @@ test("rejects replayed receipts from another run", () => {
 "#
                 .to_string(),
             },
-            WorkbenchFile {
-                path: "docs/proof-envelope.md".to_string(),
-                language: "md".to_string(),
-                content: format!(
-                    "# Proof Envelope\n\nBuild request: {objective}\n\nRequired checks:\n- JoyID proof binds the learner wallet to the run.\n- Fiber receipt proves payment before paid content opens.\n- CKB proof hash records the ship badge and receipt digest.\n- Denial path blocks unpaid reads and replayed receipts.\n"
-                ),
-            },
         ],
     }
 }
@@ -1884,17 +1924,15 @@ fn parse_quest_json(text: &str) -> Result<QuestBlueprint, ApiError> {
 
 fn quest_prompt(build_prompt: &str, track: &str, difficulty: &Difficulty) -> String {
     format!(
-        r#"You are VibeQuest's quest designer.
+        r#"You are VibeQuest's quick quest compiler.
 
-Create one gamified programming quest for a vibecoder who asked the AI to build:
+Create one tiny learning quest for this vibecoded build request:
 "{build_prompt}"
 
 Skill track: {track}
 Difficulty: {difficulty:?}
 
-Make the quest practical and focused on proving understanding of generated code. Use crisp builder/security/network language. The quest must force the learner to explain, debug, test, attack, remix, and ship the generated app. Include CKB proof and Fiber reward hooks when relevant.
-
-Return exactly 2 or 3 compact workbench files. Keep file content concrete, testable, and short enough for a browser editor. Prefer one implementation file, one test file, and one proof/readme file."#
+Return a fast, compact quest. Use exactly 3 comprehension gates: Explain, Verify, Ship. Use exactly 2 workbench files: one short TypeScript implementation file and one short TypeScript test file. Keep every file under 55 lines. Include CKB/Fiber proof language, an unpaid/invalid denial path, and a replay-safe run binding. No long prose."#
     )
 }
 
@@ -1931,12 +1969,12 @@ fn quest_json_schema() -> Value {
                 },
                 "comprehension_gates": {
                     "type": "array",
-                    "minItems": 5,
-                    "maxItems": 5,
+                    "minItems": 3,
+                    "maxItems": 3,
                     "items": {
                         "type": "string"
                     },
-                    "description": "Exactly five short gates: explain, debug, remix, attack, ship."
+                    "description": "Exactly three short gates: explain, verify, ship."
                 },
                 "boss_fight": {
                     "type": "string",
@@ -1948,8 +1986,8 @@ fn quest_json_schema() -> Value {
                 },
                 "ckb_fiber_hooks": {
                     "type": "array",
-                    "minItems": 2,
-                    "maxItems": 3,
+                    "minItems": 1,
+                    "maxItems": 2,
                     "items": {
                         "type": "string"
                     },
@@ -1958,7 +1996,7 @@ fn quest_json_schema() -> Value {
                 "workbench_files": {
                     "type": "array",
                     "minItems": 2,
-                    "maxItems": 3,
+                    "maxItems": 2,
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
@@ -1978,7 +2016,7 @@ fn quest_json_schema() -> Value {
                             }
                         }
                     },
-                    "description": "Generated workbench files the learner must inspect and improve."
+                    "description": "Exactly two compact generated files: implementation and test."
                 }
             }
         }
@@ -2033,7 +2071,7 @@ mod tests {
         let parsed = parse_openai_quest_response(response).unwrap();
 
         assert_eq!(parsed.title, "Receipt Raid");
-        assert_eq!(parsed.comprehension_gates.len(), 5);
+        assert_eq!(parsed.comprehension_gates.len(), 3);
     }
 
     #[test]
@@ -2165,7 +2203,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert_eq!(quest.workbench_files.len(), 3);
+        assert_eq!(quest.workbench_files.len(), 2);
         assert!(haystack.contains("blocks unpaid reads"));
         assert!(haystack.contains("rejects replayed receipts"));
         assert!(haystack.contains("fiber"));
@@ -2197,15 +2235,15 @@ mod tests {
         );
         assert_eq!(
             ReasoningEffort::Xhigh.serverless_safe(),
-            ReasoningEffort::Low
+            ReasoningEffort::Minimal
         );
         assert_eq!(
             ReasoningEffort::High.serverless_safe(),
-            ReasoningEffort::Low
+            ReasoningEffort::Minimal
         );
         assert_eq!(
             ReasoningEffort::Medium.serverless_safe(),
-            ReasoningEffort::Medium
+            ReasoningEffort::Minimal
         );
     }
 
@@ -2388,10 +2426,8 @@ mod tests {
             build_objective: "Build a Fiber paywall".to_string(),
             comprehension_gates: vec![
                 "Explain the verifier.".to_string(),
-                "Debug the unpaid route.".to_string(),
-                "Remix the pricing model.".to_string(),
-                "Attack receipt replay.".to_string(),
-                "Ship with tests.".to_string(),
+                "Verify the denial test.".to_string(),
+                "Ship with badge proof.".to_string(),
             ],
             boss_fight: "Patch the replayable receipt.".to_string(),
             reward_logic: "XP per gate, reward after boss.".to_string(),
