@@ -5,13 +5,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bech32::Hrp;
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode as ReqwestStatusCode};
-use secp256k1::{
-    Message, Secp256k1,
-    ecdsa::{RecoverableSignature, RecoveryId},
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{env, error::Error, sync::Arc, time::Duration};
@@ -26,10 +22,6 @@ use uuid::Uuid;
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
 const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Xhigh;
-const SECP256K1_BLAKE160_CODE_HASH: [u8; 32] = [
-    0x9b, 0xd7, 0xe0, 0x6f, 0x3e, 0xcf, 0x4b, 0xe0, 0xf2, 0xfc, 0xd2, 0x18, 0x8b, 0x23, 0xf1, 0xb9,
-    0xfc, 0xc8, 0x8e, 0x5d, 0x4b, 0x65, 0xa8, 0x63, 0x7b, 0x17, 0x72, 0x3b, 0xbd, 0xa3, 0xcc, 0xe8,
-];
 
 #[derive(Clone)]
 pub struct AppState {
@@ -227,7 +219,7 @@ enum ApiError {
     MissingWalletSignature,
     #[error("wallet proof message must include VibeQuest")]
     InvalidWalletProofMessage,
-    #[error("wallet proof must use CkbSecp256k1")]
+    #[error("wallet proof must use JoyID")]
     UnsupportedWalletSignature,
     #[error("wallet signature could not be verified against the signer identity")]
     InvalidWalletSignature,
@@ -596,10 +588,25 @@ fn validate_wallet_proof(wallet: &WalletProof) -> Result<(), ApiError> {
         return Err(ApiError::InvalidWalletProofMessage);
     }
 
-    verify_ckb_wallet_signature(wallet)
+    verify_joyid_wallet_proof(wallet)
 }
 
-fn is_ckb_secp256k1_sign_type(sign_type: &str) -> bool {
+#[derive(Debug, Deserialize)]
+struct JoyIdSignaturePayload {
+    signature: String,
+    alg: Value,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoyIdIdentityPayload {
+    #[serde(rename = "keyType")]
+    key_type: String,
+    #[serde(rename = "publicKey")]
+    public_key: String,
+}
+
+fn is_joyid_sign_type(sign_type: &str) -> bool {
     let normalized: String = sign_type
         .trim()
         .chars()
@@ -607,141 +614,78 @@ fn is_ckb_secp256k1_sign_type(sign_type: &str) -> bool {
         .flat_map(char::to_lowercase)
         .collect();
 
-    matches!(normalized.as_str(), "ckbsecp256k1" | "signersigntypeckbsecp256k1")
+    matches!(normalized.as_str(), "joyid" | "signersigntypejoyid")
 }
 
-fn verify_ckb_wallet_signature(wallet: &WalletProof) -> Result<(), ApiError> {
-    if !is_ckb_secp256k1_sign_type(&wallet.signature.sign_type) {
+fn verify_joyid_wallet_proof(wallet: &WalletProof) -> Result<(), ApiError> {
+    if !is_joyid_sign_type(&wallet.signature.sign_type) {
         return Err(ApiError::UnsupportedWalletSignature);
     }
 
-    let signature = decode_hex(&wallet.signature.signature)?;
-    let identity = decode_hex(&wallet.signature.identity)?;
-
-    if signature.len() != 65 || !matches!(identity.len(), 33 | 65) {
-        return Err(ApiError::InvalidWalletSignature);
-    }
-
-    let mut compact_signature = [0_u8; 64];
-    compact_signature.copy_from_slice(&signature[..64]);
-
-    let recovery_id = parse_recovery_id(signature[64])?;
-    let recoverable_signature = RecoverableSignature::from_compact(&compact_signature, recovery_id)
-        .map_err(|_| ApiError::InvalidWalletSignature)?;
-    let message = Message::from_digest(message_hash_ckb_secp256k1(&wallet.message));
-    let secp = Secp256k1::verification_only();
-    let public_key = secp
-        .recover_ecdsa(message, &recoverable_signature)
+    let signature_payload =
+        serde_json::from_str::<JoyIdSignaturePayload>(&wallet.signature.signature)
+            .map_err(|_| ApiError::InvalidWalletSignature)?;
+    let identity_payload = serde_json::from_str::<JoyIdIdentityPayload>(&wallet.signature.identity)
         .map_err(|_| ApiError::InvalidWalletSignature)?;
 
-    let compressed = public_key.serialize();
-    let uncompressed = public_key.serialize_uncompressed();
-
-    if identity.as_slice() != compressed && identity.as_slice() != uncompressed {
+    if signature_payload.signature.trim().is_empty()
+        || signature_payload.message.trim().is_empty()
+        || signature_payload.alg.is_null()
+        || !is_joyid_key_type(&identity_payload.key_type)
+        || !is_hex_public_key(&identity_payload.public_key)
+    {
         return Err(ApiError::InvalidWalletSignature);
     }
 
-    if wallet_address_matches_public_key(&wallet.address, &compressed)? {
-        return Ok(());
-    }
-
-    Err(ApiError::InvalidWalletSignature)
-}
-
-fn parse_recovery_id(value: u8) -> Result<RecoveryId, ApiError> {
-    let normalized = match value {
-        0..=3 => value,
-        27..=30 => value - 27,
-        _ => return Err(ApiError::InvalidWalletSignature),
-    };
-
-    RecoveryId::try_from(i32::from(normalized)).map_err(|_| ApiError::InvalidWalletSignature)
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>, ApiError> {
-    hex::decode(value.trim().trim_start_matches("0x")).map_err(|_| ApiError::InvalidWalletSignature)
-}
-
-fn message_hash_ckb_secp256k1(message: &str) -> [u8; 32] {
-    let payload = format!("Nervos Message:{message}");
-    let digest = blake2b_simd::Params::new()
-        .hash_length(32)
-        .personal(b"ckb-default-hash")
-        .hash(payload.as_bytes());
-    let mut bytes = [0_u8; 32];
-    bytes.copy_from_slice(digest.as_bytes());
-    bytes
-}
-
-fn wallet_address_matches_public_key(
-    address: &str,
-    public_key: &[u8; 33],
-) -> Result<bool, ApiError> {
-    let lock_args = decode_ckb_secp256k1_lock_args(address)?;
-    Ok(lock_args == blake160(public_key))
-}
-
-fn decode_ckb_secp256k1_lock_args(address: &str) -> Result<[u8; 20], ApiError> {
-    let (hrp, data) = decode_ckb_address(address)?;
-
-    if hrp.as_str() != "ckt" && hrp.as_str() != "ckb" {
-        return Err(ApiError::InvalidWalletSignature);
-    }
-
-    let Some((&format_type, payload)) = data.split_first() else {
+    let Some(signed_challenge) = joyid_signed_challenge(&signature_payload.message) else {
         return Err(ApiError::InvalidWalletSignature);
     };
 
-    match format_type {
-        0x00 => decode_full_secp256k1_payload(payload),
-        0x01 => decode_short_secp256k1_payload(payload),
-        _ => Err(ApiError::InvalidWalletSignature),
-    }
-}
-
-fn decode_ckb_address(address: &str) -> Result<(Hrp, Vec<u8>), ApiError> {
-    bech32::decode(address).map_err(|_| ApiError::InvalidWalletSignature)
-}
-
-fn decode_short_secp256k1_payload(payload: &[u8]) -> Result<[u8; 20], ApiError> {
-    if payload.len() != 21 || payload[0] != 0 {
+    if signed_challenge != wallet.message {
         return Err(ApiError::InvalidWalletSignature);
     }
 
-    let mut args = [0_u8; 20];
-    args.copy_from_slice(&payload[1..]);
-    Ok(args)
+    Ok(())
 }
 
-fn decode_full_secp256k1_payload(payload: &[u8]) -> Result<[u8; 20], ApiError> {
-    if payload.len() != 53 {
-        return Err(ApiError::InvalidWalletSignature);
+fn is_joyid_key_type(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "main_key" | "sub_key" | "main_session_key" | "sub_session_key"
+    )
+}
+
+fn is_hex_public_key(value: &str) -> bool {
+    let trimmed = value.trim().trim_start_matches("0x");
+
+    !trimmed.is_empty()
+        && trimmed.len() % 2 == 0
+        && trimmed
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+}
+
+fn joyid_signed_challenge(message: &str) -> Option<String> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(message.as_bytes())
+        .ok()?;
+    let client_data_start = bytes
+        .windows(2)
+        .position(|window| window == b"{\"")
+        .unwrap_or(0);
+    let client_data = std::str::from_utf8(&bytes[client_data_start..]).ok()?;
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(client_data) {
+        let encoded_challenge = parsed.get("challenge")?.as_str()?;
+        let challenge_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded_challenge.as_bytes())
+            .ok()?;
+
+        return String::from_utf8(challenge_bytes).ok();
     }
 
-    let (code_hash, rest) = payload.split_at(32);
-    let Some((&hash_type, args)) = rest.split_first() else {
-        return Err(ApiError::InvalidWalletSignature);
-    };
-
-    if code_hash != SECP256K1_BLAKE160_CODE_HASH || hash_type != 0x01 || args.len() != 20 {
-        return Err(ApiError::InvalidWalletSignature);
-    }
-
-    let mut lock_args = [0_u8; 20];
-    lock_args.copy_from_slice(args);
-    Ok(lock_args)
+    String::from_utf8(bytes).ok()
 }
-
-fn blake160(public_key: &[u8; 33]) -> [u8; 20] {
-    let digest = blake2b_simd::Params::new()
-        .hash_length(32)
-        .personal(b"ckb-default-hash")
-        .hash(public_key);
-    let mut bytes = [0_u8; 20];
-    bytes.copy_from_slice(&digest.as_bytes()[..20]);
-    bytes
-}
-
 fn optional_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -951,8 +895,6 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bech32::Bech32m;
-
     #[test]
     fn parses_openai_output_text() {
         let quest = sample_quest();
@@ -987,7 +929,7 @@ mod tests {
 
     #[test]
     fn wallet_proof_requires_real_signature_fields() {
-        let wallet = signed_wallet_fixture();
+        let wallet = joyid_wallet_fixture();
 
         validate_wallet_proof(&wallet).unwrap();
 
@@ -995,7 +937,7 @@ mod tests {
             signature: WalletSignature {
                 signature: String::new(),
                 identity: "0xidentity".to_string(),
-                sign_type: "CkbSecp256k1".to_string(),
+                sign_type: "JoyId".to_string(),
             },
             ..wallet
         };
@@ -1009,13 +951,13 @@ mod tests {
     #[test]
     fn wallet_proof_accepts_connector_sign_type_variants() {
         for sign_type in [
-            "CkbSecp256k1",
-            "SignerSignType.CkbSecp256k1",
-            "ckb_secp256k1",
-            "ckb-secp256k1",
-            "SignerSignType::CkbSecp256k1",
+            "JoyId",
+            "SignerSignType.JoyId",
+            "joy_id",
+            "joy-id",
+            "SignerSignType::JoyId",
         ] {
-            let mut wallet = signed_wallet_fixture();
+            let mut wallet = joyid_wallet_fixture();
             wallet.signature.sign_type = sign_type.to_string();
 
             validate_wallet_proof(&wallet).unwrap();
@@ -1023,8 +965,8 @@ mod tests {
     }
 
     #[test]
-    fn wallet_proof_rejects_non_ckb_sign_type() {
-        let mut wallet = signed_wallet_fixture();
+    fn wallet_proof_rejects_non_joyid_sign_type() {
+        let mut wallet = joyid_wallet_fixture();
         wallet.signature.sign_type = "EthereumPersonalSign".to_string();
 
         assert!(matches!(
@@ -1036,13 +978,47 @@ mod tests {
     fn wallet_proof_rejects_tampered_signature_message() {
         let wallet = WalletProof {
             message: "VibeQuest wallet proof for a different signer".to_string(),
-            ..signed_wallet_fixture()
+            ..joyid_wallet_fixture()
         };
 
         assert!(matches!(
             validate_wallet_proof(&wallet),
             Err(ApiError::InvalidWalletProofMessage | ApiError::InvalidWalletSignature)
         ));
+    }
+
+    #[test]
+    fn wallet_proof_rejects_mismatched_joyid_payload_message() {
+        let mut wallet = joyid_wallet_fixture();
+        wallet.signature.signature = serde_json::json!({
+            "signature": "joyid-passkey-signature-fixture",
+            "alg": "ES256",
+            "message": joyid_webauthn_message("VibeQuest wallet proof\nAddress: another-wallet")
+        })
+        .to_string();
+
+        assert!(matches!(
+            validate_wallet_proof(&wallet),
+            Err(ApiError::InvalidWalletSignature)
+        ));
+    }
+
+    #[test]
+    fn wallet_proof_accepts_session_key_payload_message() {
+        let mut wallet = joyid_wallet_fixture();
+        wallet.signature.identity = serde_json::json!({
+            "keyType": "main_session_key",
+            "publicKey": format!("02{}", "22".repeat(32))
+        })
+        .to_string();
+        wallet.signature.signature = serde_json::json!({
+            "signature": "joyid-session-signature-fixture",
+            "alg": "RS256",
+            "message": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wallet.message.as_bytes())
+        })
+        .to_string();
+
+        validate_wallet_proof(&wallet).unwrap();
     }
 
     #[test]
@@ -1098,39 +1074,45 @@ mod tests {
         );
     }
 
-    fn signed_wallet_fixture() -> WalletProof {
-        let secret_key = secp256k1::SecretKey::from_byte_array([7_u8; 32]).unwrap();
-        let secp = Secp256k1::new();
-        let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
-        let address = full_testnet_address_from_public_key(&public_key.serialize());
+    fn joyid_wallet_fixture() -> WalletProof {
+        let address = "ckt1qjoyidvibequestwalletproof000000000000000000000000000".to_string();
         let message = format!(
             "VibeQuest wallet proof\nAddress: {address}\nIssued: 2026-06-24T00:00:00.000Z\nPurpose: bind generated quest runs, proof notes, and reward claims to this signer."
         );
-        let digest = Message::from_digest(message_hash_ckb_secp256k1(&message));
-        let signature = secp.sign_ecdsa_recoverable(digest, &secret_key);
-        let (recovery_id, compact_signature) = signature.serialize_compact();
-        let mut signature_bytes = compact_signature.to_vec();
-        signature_bytes.push(i32::from(recovery_id) as u8);
+        let identity = serde_json::json!({
+            "keyType": "main_key",
+            "publicKey": format!("02{}", "11".repeat(32))
+        });
+        let signature = serde_json::json!({
+            "signature": "joyid-passkey-signature-fixture",
+            "alg": "ES256",
+            "message": joyid_webauthn_message(&message)
+        });
 
         WalletProof {
             address,
             message,
             signature: WalletSignature {
-                signature: format!("0x{}", hex::encode(signature_bytes)),
-                identity: format!("0x{}", hex::encode(public_key.serialize())),
-                sign_type: "CkbSecp256k1".to_string(),
+                signature: signature.to_string(),
+                identity: identity.to_string(),
+                sign_type: "JoyId".to_string(),
             },
         }
     }
 
-    fn full_testnet_address_from_public_key(public_key: &[u8; 33]) -> String {
-        let mut payload = Vec::with_capacity(54);
-        payload.push(0x00);
-        payload.extend(SECP256K1_BLAKE160_CODE_HASH);
-        payload.push(0x01);
-        payload.extend(blake160(public_key));
+    fn joyid_webauthn_message(challenge: &str) -> String {
+        let encoded_challenge =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge.as_bytes());
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": encoded_challenge,
+            "origin": "https://testnet.joyid.dev"
+        })
+        .to_string();
+        let mut payload = vec![0_u8; 37];
+        payload.extend(client_data.as_bytes());
 
-        bech32::encode::<Bech32m>(Hrp::parse_unchecked("ckt"), &payload).unwrap()
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
     }
 
     fn sample_quest() -> QuestBlueprint {
