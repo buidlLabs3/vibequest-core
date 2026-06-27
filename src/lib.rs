@@ -156,6 +156,7 @@ struct GenerateQuestResponse {
 #[serde(rename_all = "kebab-case")]
 enum QuestSource {
     OpenAi,
+    CoreFallback,
 }
 
 #[derive(Debug, Serialize)]
@@ -526,11 +527,18 @@ async fn generate_quest(
     validate_wallet_proof(&request.wallet)?;
 
     let run_id = Uuid::new_v4();
-    let quest = state.openai.generate_quest(&request).await?;
+    let (source, quest) = match state.openai.generate_quest(&request).await {
+        Ok(quest) => (QuestSource::OpenAi, quest),
+        Err(ApiError::OpenAiTransport(_)) => (
+            QuestSource::CoreFallback,
+            fallback_quest_blueprint(&request, run_id),
+        ),
+        Err(error) => return Err(error),
+    };
 
     Ok(Json(GenerateQuestResponse {
         run_id,
-        source: QuestSource::OpenAi,
+        source,
         wallet: WalletBinding {
             address: request.wallet.address.trim().to_string(),
             identity: request.wallet.signature.identity.trim().to_string(),
@@ -744,6 +752,112 @@ fn truncate_error_body(body: &str) -> String {
         .collect::<String>();
     truncated.push_str("...");
     truncated
+}
+
+fn fallback_quest_blueprint(request: &GenerateQuestRequest, run_id: Uuid) -> QuestBlueprint {
+    let track = request
+        .skill_track
+        .as_deref()
+        .unwrap_or("Fiber Builder")
+        .trim();
+    let objective = request.build_prompt.trim();
+    let run_suffix = run_id.simple().to_string();
+    let short_run = &run_suffix[..8];
+
+    QuestBlueprint {
+        title: format!("{} Proof Run", track.replace(" Builder", "")),
+        premise: "The AI gateway stalled, so VibeQuest Core compiled a deterministic CKB/Fiber quest you can still inspect, test, and defend.".to_string(),
+        build_objective: objective.to_string(),
+        comprehension_gates: vec![
+            "Explain what the receipt verifier trusts from JoyID, CKB proof data, and Fiber payment state.".to_string(),
+            "Debug the unpaid-read denial path so a missing receipt cannot unlock protected content.".to_string(),
+            "Remix the payout split to support a creator, sponsor, and protocol fee recipient.".to_string(),
+            "Attack the proof flow by describing a replay attempt and the nonce/run binding that blocks it.".to_string(),
+            "Ship only after the generated test passes and the boss answer proves you understand the diff.".to_string(),
+        ],
+        boss_fight: "A user tries to reuse a valid Fiber receipt from another run. Identify the missing binding and patch the verifier so receipts are scoped to the active VibeQuest run.".to_string(),
+        reward_logic: "XP unlocks per comprehension gate. Fiber rewards and the CKB proof badge unlock only after the denial-path test and boss challenge pass.".to_string(),
+        ckb_fiber_hooks: vec![
+            "CKB stores the quest receipt hash, JoyID proof digest, and ship badge metadata.".to_string(),
+            "Fiber handles instant hint fees, sponsor rewards, and creator payout settlement.".to_string(),
+            "The run nonce binds receipts to this generated workspace so replayed proofs fail.".to_string(),
+        ],
+        workbench_files: vec![
+            WorkbenchFile {
+                path: "src/paywallVerifier.ts".to_string(),
+                language: "ts".to_string(),
+                content: format!(
+                    r#"export type Receipt = {{
+  runId: string;
+  reader: string;
+  contentId: string;
+  fiberPreimage: string;
+  ckbProofHash: string;
+}};
+
+export type AccessRequest = {{
+  runId: string;
+  reader: string;
+  contentId: string;
+  receipt?: Receipt;
+}};
+
+export function canReadPaidContent(request: AccessRequest): boolean {{
+  const receipt = request.receipt;
+  if (!receipt) return false;
+
+  const sameRun = receipt.runId === request.runId;
+  const sameReader = receipt.reader === request.reader;
+  const sameContent = receipt.contentId === request.contentId;
+  const hasFiberProof = receipt.fiberPreimage.length >= 16;
+  const hasCkbProof = receipt.ckbProofHash.startsWith("0x");
+
+  return sameRun && sameReader && sameContent && hasFiberProof && hasCkbProof;
+}}
+
+export const ACTIVE_RUN_ID = "vq-{short_run}";
+"#
+                ),
+            },
+            WorkbenchFile {
+                path: "tests/paywallVerifier.test.ts".to_string(),
+                language: "test.ts".to_string(),
+                content: r#"import { canReadPaidContent, ACTIVE_RUN_ID } from "../src/paywallVerifier";
+
+test("blocks unpaid reads", () => {
+  expect(canReadPaidContent({
+    runId: ACTIVE_RUN_ID,
+    reader: "ckt1reader",
+    contentId: "lesson-1"
+  })).toBe(false);
+});
+
+test("rejects replayed receipts from another run", () => {
+  expect(canReadPaidContent({
+    runId: ACTIVE_RUN_ID,
+    reader: "ckt1reader",
+    contentId: "lesson-1",
+    receipt: {
+      runId: "vq-old-run",
+      reader: "ckt1reader",
+      contentId: "lesson-1",
+      fiberPreimage: "fiber-preimage-ok",
+      ckbProofHash: "0xabc123"
+    }
+  })).toBe(false);
+});
+"#
+                .to_string(),
+            },
+            WorkbenchFile {
+                path: "docs/proof-envelope.md".to_string(),
+                language: "md".to_string(),
+                content: format!(
+                    "# Proof Envelope\n\nBuild request: {objective}\n\nRequired checks:\n- JoyID proof binds the learner wallet to the run.\n- Fiber receipt proves payment before paid content opens.\n- CKB proof hash records the ship badge and receipt digest.\n- Denial path blocks unpaid reads and replayed receipts.\n"
+                ),
+            },
+        ],
+    }
 }
 
 fn parse_openai_quest_response(response: OpenAiResponse) -> Result<QuestBlueprint, ApiError> {
@@ -1031,6 +1145,30 @@ mod tests {
         .to_string();
 
         validate_wallet_proof(&wallet).unwrap();
+    }
+
+    #[test]
+    fn fallback_quest_contains_verifiable_workspace() {
+        let request = GenerateQuestRequest {
+            build_prompt: "Build a Fiber paid-content app with CKB proof receipts".to_string(),
+            skill_track: Some("Fiber Builder".to_string()),
+            difficulty: Some(Difficulty::Builder),
+            wallet: joyid_wallet_fixture(),
+        };
+
+        let quest = fallback_quest_blueprint(&request, Uuid::nil());
+        let haystack = quest
+            .workbench_files
+            .iter()
+            .map(|file| file.content.to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(quest.workbench_files.len(), 3);
+        assert!(haystack.contains("blocks unpaid reads"));
+        assert!(haystack.contains("rejects replayed receipts"));
+        assert!(haystack.contains("fiber"));
+        assert!(haystack.contains("ckb"));
     }
 
     #[test]
