@@ -28,6 +28,10 @@ cargo run
 | `FIBER_RPC_URL` | Yes | empty | Fiber RPC endpoint used by payment, hint fee, and reward-claim readiness gates. Use a public endpoint for cloud deploys. |
 | `MONGODB_URI` | Yes | empty | MongoDB Atlas connection string for users, quest runs, progress, and ship state. |
 | `MONGODB_DATABASE` | No | `vibequest` | Database name used by the persistence layer. |
+| `FIBER_PAYOUT_ENABLED` | No | `false` | Enables real Fiber `send_payment` execution after server-side completion checks pass. |
+| `FIBER_PAYOUT_RPC_URL` | Required when payout enabled | empty | Private funded Fiber node JSON-RPC URL used for reward payouts. Do not expose this RPC publicly. |
+| `VIBEQUEST_REWARD_SHANNONS` | No | `400` | Default incentive amount for completed quests. |
+| `VIBEQUEST_REWARD_CURRENCY` | No | `Fibd` | Reward currency label for generated claims. |
 
 ## Endpoints
 
@@ -36,7 +40,8 @@ cargo run
 - `GET /season` - Season 0 tracks, gates, and product thesis.
 - `GET /users/{address}/quests` - returns the wallet profile, created/completed/uncompleted counts, active run, and recent quest history.
 - `GET /quests/{run_id}` - returns one persisted quest run.
-- `POST /quests/{run_id}/progress` - verifies the JoyID wallet proof, then saves gate, boss, and shipping progress.
+- `POST /quests/{run_id}/progress` - verifies the JoyID wallet proof, then saves gate and boss progress.
+- `POST /quests/{run_id}/complete` - performs server-side completion checks, creates a reward claim, and calls Fiber `send_payment` when payouts are enabled.
 - `POST /ai/quests/generate` - verifies a JoyID wallet proof, generates a quest, and stores it as a MongoDB quest run.
 
 Example:
@@ -85,6 +90,10 @@ vercel env add CKB_RPC_URL production
 vercel env add FIBER_RPC_URL production
 vercel env add MONGODB_URI production
 vercel env add MONGODB_DATABASE production
+vercel env add FIBER_PAYOUT_ENABLED production
+vercel env add FIBER_PAYOUT_RPC_URL production
+vercel env add VIBEQUEST_REWARD_SHANNONS production
+vercel env add VIBEQUEST_REWARD_CURRENCY production
 vercel --prod
 ```
 
@@ -103,4 +112,4 @@ docker run --rm -p 8080:8080 --env-file .env vibequest-core
 - MongoDB persistence for users, created quests, uncompleted quests, completed quests, gate progress, boss state, and ship envelopes.
 - Test-runner workers for debug and no-prompt zones.
 - CKB proof adapter for badges, receipts, and skill passport history.
-- Fiber reward adapter for hints, bounties, prizes, and creator royalties.
+- Fiber reward adapter for invoice-based quest payouts, with MongoDB claim ledger and payment receipts.
