@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
-const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Xhigh;
+const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+const SERVERLESS_OPENAI_TIMEOUT_SECONDS: u64 = 50;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -348,19 +349,23 @@ impl OpenAiClient {
             "model": self.model,
             "input": prompt,
             "reasoning": {
-                "effort": self.reasoning_effort
+                "effort": self.reasoning_effort.serverless_safe()
             },
+            "max_output_tokens": 2200,
             "store": !self.disable_response_storage,
             "text": {
                 "format": quest_json_schema()
             }
         });
+        let timeout = self
+            .timeout
+            .min(Duration::from_secs(SERVERLESS_OPENAI_TIMEOUT_SECONDS));
 
         let response = self
             .http
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(api_key)
-            .timeout(self.timeout)
+            .timeout(timeout)
             .json(&body)
             .send()
             .await
@@ -410,6 +415,13 @@ impl ReasoningEffort {
             "high" => Some(Self::High),
             "xhigh" => Some(Self::Xhigh),
             _ => None,
+        }
+    }
+
+    fn serverless_safe(self) -> Self {
+        match self {
+            Self::High | Self::Xhigh => Self::Low,
+            value => value,
         }
     }
 }
@@ -774,9 +786,9 @@ Create one gamified programming quest for a vibecoder who asked the AI to build:
 Skill track: {track}
 Difficulty: {difficulty:?}
 
-Make the quest playful, practical, and focused on proving understanding of generated code. Use a crisp builder, security, or network metaphor instead of fantasy creature mascots. The quest must force the learner to explain, debug, test, attack, remix, and ship the generated app. Include CKB proof and Fiber reward hooks when relevant.
+Make the quest practical and focused on proving understanding of generated code. Use crisp builder/security/network language. The quest must force the learner to explain, debug, test, attack, remix, and ship the generated app. Include CKB proof and Fiber reward hooks when relevant.
 
-Return realistic workbench files for the learner to inspect and edit. The files should be small enough for a browser editor but concrete enough to expose trust boundaries, tests, and payment/proof logic."#
+Return exactly 2 or 3 compact workbench files. Keep file content concrete, testable, and short enough for a browser editor. Prefer one implementation file, one test file, and one proof/readme file."#
     )
 }
 
@@ -818,7 +830,7 @@ fn quest_json_schema() -> Value {
                     "items": {
                         "type": "string"
                     },
-                    "description": "Exactly five gates: explain, debug, remix, attack, ship."
+                    "description": "Exactly five short gates: explain, debug, remix, attack, ship."
                 },
                 "boss_fight": {
                     "type": "string",
@@ -831,7 +843,7 @@ fn quest_json_schema() -> Value {
                 "ckb_fiber_hooks": {
                     "type": "array",
                     "minItems": 2,
-                    "maxItems": 4,
+                    "maxItems": 3,
                     "items": {
                         "type": "string"
                     },
@@ -840,7 +852,7 @@ fn quest_json_schema() -> Value {
                 "workbench_files": {
                     "type": "array",
                     "minItems": 2,
-                    "maxItems": 4,
+                    "maxItems": 3,
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
@@ -856,7 +868,7 @@ fn quest_json_schema() -> Value {
                             },
                             "content": {
                                 "type": "string",
-                                "description": "Small but concrete code file content."
+                                "description": "Small but concrete code file content, preferably under 80 lines."
                             }
                         }
                     },
@@ -1044,7 +1056,18 @@ mod tests {
             ReasoningEffort::parse(" HIGH "),
             Some(ReasoningEffort::High)
         );
-        assert_eq!(ReasoningEffort::parse("maximum"), None);
+        assert_eq!(
+            ReasoningEffort::Xhigh.serverless_safe(),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            ReasoningEffort::High.serverless_safe(),
+            ReasoningEffort::Low
+        );
+        assert_eq!(
+            ReasoningEffort::Medium.serverless_safe(),
+            ReasoningEffort::Medium
+        );
     }
 
     #[test]
