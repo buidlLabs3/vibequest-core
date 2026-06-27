@@ -175,6 +175,13 @@ struct GenerateQuestResponse {
     wallet: WalletBinding,
     quest: QuestBlueprint,
     ship_requirements: ShipRequirements,
+    persistence: PersistenceStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistenceStatus {
+    saved: bool,
+    warning: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1472,7 +1479,7 @@ async fn generate_quest(
         Err(error) => return Err(error),
     };
 
-    let response = GenerateQuestResponse {
+    let mut response = GenerateQuestResponse {
         run_id,
         source,
         wallet: WalletBinding {
@@ -1488,9 +1495,13 @@ async fn generate_quest(
             can_claim_rewards: state.config.ckb_rpc_url.is_some()
                 && state.config.fiber_rpc_url.is_some(),
         },
+        persistence: PersistenceStatus {
+            saved: !state.store.is_configured(),
+            warning: None,
+        },
     };
 
-    state
+    match state
         .store
         .record_generated_quest(
             &request,
@@ -1498,7 +1509,20 @@ async fn generate_quest(
             state.config.reward_amount_shannons,
             &state.config.reward_currency,
         )
-        .await?;
+        .await
+    {
+        Ok(()) => {
+            response.persistence.saved = true;
+        }
+        Err(error @ (ApiError::Database(_) | ApiError::DatabaseUnavailable)) => {
+            warn!(%error, "quest generated but persistence is degraded");
+            response.persistence.warning = Some(
+                "Quest loaded, but MongoDB could not save it yet. Complete this run after persistence recovers."
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(error),
+    }
 
     Ok(Json(response))
 }
