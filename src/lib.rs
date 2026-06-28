@@ -188,7 +188,6 @@ struct PersistenceStatus {
 #[serde(rename_all = "kebab-case")]
 enum QuestSource {
     OpenAi,
-    CoreFallback,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -257,20 +256,20 @@ enum ApiError {
     UnsupportedWalletSignature,
     #[error("wallet signature could not be verified against the signer identity")]
     InvalidWalletSignature,
-    #[error("OPENAI_API_KEY is required")]
+    #[error("OpenAI is not configured. Add OPENAI_API_KEY before generating live quests.")]
     MissingOpenAiKey,
-    #[error("openai request failed: {0}")]
+    #[error("AI quest generation is temporarily unavailable. Please regenerate in a moment.")]
     OpenAiTransport(String),
-    #[error("openai gateway returned {status}: {body}")]
+    #[error("AI quest generation is temporarily unavailable. Please regenerate in a moment.")]
     OpenAiStatus {
         status: ReqwestStatusCode,
         body: String,
     },
-    #[error("openai response did not contain valid quest json")]
+    #[error("The AI response was incomplete. Please regenerate the quest.")]
     InvalidAiResponse,
-    #[error("MongoDB is not configured on vibequest-core")]
+    #[error("Quest history is temporarily unavailable because MongoDB is not configured.")]
     DatabaseUnavailable,
-    #[error("database operation failed: {0}")]
+    #[error("Quest history is temporarily unavailable. Please refresh in a moment.")]
     Database(String),
     #[error("quest run was not found")]
     QuestNotFound,
@@ -538,6 +537,24 @@ impl MongoStore {
 
     fn is_configured(&self) -> bool {
         self.uri.is_some()
+    }
+
+    async fn is_available(&self) -> bool {
+        if !self.is_configured() {
+            return false;
+        }
+
+        tokio::time::timeout(Duration::from_secs(4), async {
+            let Ok(database) = self.database().await else {
+                return false;
+            };
+            let mut command = Document::new();
+            command.insert("ping", 1);
+
+            database.run_command(command).await.is_ok()
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn database(&self) -> Result<Database, ApiError> {
@@ -1365,21 +1382,26 @@ impl ReasoningEffort {
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let integrations = integration_status(&state).await;
+    let missing = missing_integrations(&state, &integrations);
+
     Json(HealthResponse {
         service: "vibequest-core",
         status: "ok",
         environment: state.config.app_env.clone(),
         ai_layer: AiLayer::OpenAi,
-        integrations: integration_status(&state),
-        missing: missing_integrations(&state),
+        integrations,
+        missing,
         timestamp: Utc::now(),
     })
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<ReadyResponse>) {
-    let missing = missing_integrations(&state);
+    let integrations = integration_status(&state).await;
+    let missing = missing_integrations(&state, &integrations);
 
-    let status = if missing.is_empty() {
+    let is_ready = missing.is_empty();
+    let status = if is_ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1388,7 +1410,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<ReadyRes
     (
         status,
         Json(ReadyResponse {
-            ready: missing.is_empty(),
+            ready: is_ready,
             missing,
             timestamp: Utc::now(),
         }),
@@ -1464,20 +1486,12 @@ async fn generate_quest(
     validate_wallet_proof(&request.wallet)?;
 
     let run_id = Uuid::new_v4();
-    let (source, quest) = match state.openai.generate_quest(&request).await {
-        Ok(quest) => (
-            QuestSource::OpenAi,
-            compact_quest_blueprint(quest, &request, run_id),
-        ),
-        Err(ApiError::MissingOpenAiKey)
-        | Err(ApiError::OpenAiTransport(_))
-        | Err(ApiError::OpenAiStatus { .. })
-        | Err(ApiError::InvalidAiResponse) => (
-            QuestSource::CoreFallback,
-            fallback_quest_blueprint(&request, run_id),
-        ),
-        Err(error) => return Err(error),
-    };
+    let quest = state
+        .openai
+        .generate_quest(&request)
+        .await
+        .and_then(compact_quest_blueprint)?;
+    let source = QuestSource::OpenAi;
 
     let mut response = GenerateQuestResponse {
         run_id,
@@ -1496,7 +1510,7 @@ async fn generate_quest(
                 && state.config.fiber_rpc_url.is_some(),
         },
         persistence: PersistenceStatus {
-            saved: !state.store.is_configured(),
+            saved: false,
             warning: None,
         },
     };
@@ -1516,10 +1530,7 @@ async fn generate_quest(
         }
         Err(error @ (ApiError::Database(_) | ApiError::DatabaseUnavailable)) => {
             warn!(%error, "quest generated but persistence is degraded");
-            response.persistence.warning = Some(
-                "Quest loaded, but MongoDB could not save it yet. Complete this run after persistence recovers."
-                    .to_string(),
-            );
+            return Err(error);
         }
         Err(error) => return Err(error),
     }
@@ -1568,32 +1579,36 @@ async fn complete_quest(
     ))
 }
 
-fn integration_status(state: &AppState) -> IntegrationStatus {
+async fn integration_status(state: &AppState) -> IntegrationStatus {
     IntegrationStatus {
         openai: state.openai.api_key.is_some(),
         ckb_rpc: state.config.ckb_rpc_url.is_some(),
         fiber_rpc: state.config.fiber_rpc_url.is_some(),
         fiber_payout: state.fiber.is_ready(),
-        mongodb: state.store.is_configured(),
+        mongodb: state.store.is_available().await,
     }
 }
 
-fn missing_integrations(state: &AppState) -> Vec<&'static str> {
+fn missing_integrations(state: &AppState, integrations: &IntegrationStatus) -> Vec<&'static str> {
     let mut missing = Vec::new();
 
-    if state.openai.api_key.is_none() {
+    if !integrations.openai {
         missing.push("OPENAI_API_KEY");
     }
 
-    if state.config.ckb_rpc_url.is_none() {
+    if !integrations.ckb_rpc {
         missing.push("CKB_RPC_URL");
     }
 
-    if state.config.fiber_rpc_url.is_none() {
+    if !integrations.fiber_rpc {
         missing.push("FIBER_RPC_URL");
     }
 
-    if !state.store.is_configured() {
+    if state.store.is_configured() {
+        if !integrations.mongodb {
+            missing.push("MONGODB_CONNECTION");
+        }
+    } else {
         missing.push("MONGODB_URI");
     }
 
@@ -1605,7 +1620,14 @@ fn missing_integrations(state: &AppState) -> Vec<&'static str> {
 }
 
 fn warn_missing_integrations(state: &AppState) {
-    let missing = missing_integrations(state);
+    let integrations = IntegrationStatus {
+        openai: state.openai.api_key.is_some(),
+        ckb_rpc: state.config.ckb_rpc_url.is_some(),
+        fiber_rpc: state.config.fiber_rpc_url.is_some(),
+        fiber_payout: state.fiber.is_ready(),
+        mongodb: state.store.is_configured(),
+    };
+    let missing = missing_integrations(state, &integrations);
 
     if !missing.is_empty() {
         warn!(
@@ -1777,11 +1799,7 @@ fn truncate_error_body(body: &str) -> String {
     truncated
 }
 
-fn compact_quest_blueprint(
-    mut quest: QuestBlueprint,
-    request: &GenerateQuestRequest,
-    run_id: Uuid,
-) -> QuestBlueprint {
+fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, ApiError> {
     if quest.comprehension_gates.len() > 3 {
         quest.comprehension_gates.truncate(3);
     }
@@ -1802,11 +1820,16 @@ fn compact_quest_blueprint(
         file.content = compact_file_content(&file.content, 80);
     }
 
-    if quest.workbench_files.is_empty() {
-        quest = fallback_quest_blueprint(request, run_id);
+    if quest.workbench_files.is_empty()
+        || quest
+            .workbench_files
+            .iter()
+            .any(|file| file.path.trim().is_empty() || file.content.trim().is_empty())
+    {
+        return Err(ApiError::InvalidAiResponse);
     }
 
-    quest
+    Ok(quest)
 }
 
 fn compact_file_content(content: &str, max_lines: usize) -> String {
@@ -1818,102 +1841,6 @@ fn compact_file_content(content: &str, max_lines: usize) -> String {
     let mut compacted = lines[..max_lines].join("\n");
     compacted.push_str("\n// VibeQuest clipped this file to keep the browser workbench fast.\n");
     compacted
-}
-
-fn fallback_quest_blueprint(request: &GenerateQuestRequest, run_id: Uuid) -> QuestBlueprint {
-    let track = request
-        .skill_track
-        .as_deref()
-        .unwrap_or("Fiber Builder")
-        .trim();
-    let objective = request.build_prompt.trim();
-    let run_suffix = run_id.simple().to_string();
-    let short_run = &run_suffix[..8];
-
-    QuestBlueprint {
-        title: format!("{} Proof Run", track.replace(" Builder", "")),
-        premise: "VibeQuest compiled a quick CKB/Fiber badge quest you can inspect, verify, and ship without waiting on a long AI response.".to_string(),
-        build_objective: objective.to_string(),
-        comprehension_gates: vec![
-            "Explain what the verifier trusts from JoyID, CKB proof hash, and Fiber receipt state.".to_string(),
-            "Verify that unpaid reads and replayed receipts are rejected by the test file.".to_string(),
-            "Ship the success badge after the checks pass and the boss answer proves understanding.".to_string(),
-        ],
-        boss_fight: "A user tries to reuse a valid Fiber receipt from another run. Identify the missing binding and patch the verifier so receipts are scoped to the active VibeQuest run.".to_string(),
-        reward_logic: "XP unlocks per comprehension gate. Fiber rewards and the CKB proof badge unlock only after the denial-path test and boss challenge pass.".to_string(),
-        ckb_fiber_hooks: vec![
-            "CKB stores the quest receipt hash, JoyID proof digest, and success badge metadata.".to_string(),
-            "Fiber reward claims stay invoice-bound after the learner ships the badge.".to_string(),
-        ],
-        workbench_files: vec![
-            WorkbenchFile {
-                path: "src/paywallVerifier.ts".to_string(),
-                language: "ts".to_string(),
-                content: format!(
-                    r#"export type Receipt = {{
-  runId: string;
-  reader: string;
-  contentId: string;
-  fiberPreimage: string;
-  ckbProofHash: string;
-}};
-
-export type AccessRequest = {{
-  runId: string;
-  reader: string;
-  contentId: string;
-  receipt?: Receipt;
-}};
-
-export function canReadPaidContent(request: AccessRequest): boolean {{
-  const receipt = request.receipt;
-  if (!receipt) return false;
-
-  const sameRun = receipt.runId === request.runId;
-  const sameReader = receipt.reader === request.reader;
-  const sameContent = receipt.contentId === request.contentId;
-  const hasFiberProof = receipt.fiberPreimage.length >= 16;
-  const hasCkbProof = receipt.ckbProofHash.startsWith("0x");
-
-  return sameRun && sameReader && sameContent && hasFiberProof && hasCkbProof;
-}}
-
-export const ACTIVE_RUN_ID = "vq-{short_run}";
-"#
-                ),
-            },
-            WorkbenchFile {
-                path: "tests/paywallVerifier.test.ts".to_string(),
-                language: "test.ts".to_string(),
-                content: r#"import { canReadPaidContent, ACTIVE_RUN_ID } from "../src/paywallVerifier";
-
-test("blocks unpaid reads", () => {
-  expect(canReadPaidContent({
-    runId: ACTIVE_RUN_ID,
-    reader: "ckt1reader",
-    contentId: "lesson-1"
-  })).toBe(false);
-});
-
-test("rejects replayed receipts from another run", () => {
-  expect(canReadPaidContent({
-    runId: ACTIVE_RUN_ID,
-    reader: "ckt1reader",
-    contentId: "lesson-1",
-    receipt: {
-      runId: "vq-old-run",
-      reader: "ckt1reader",
-      contentId: "lesson-1",
-      fiberPreimage: "fiber-preimage-ok",
-      ckbProofHash: "0xabc123"
-    }
-  })).toBe(false);
-});
-"#
-                .to_string(),
-            },
-        ],
-    }
 }
 
 fn parse_openai_quest_response(response: OpenAiResponse) -> Result<QuestBlueprint, ApiError> {
@@ -1947,16 +1874,28 @@ fn parse_quest_json(text: &str) -> Result<QuestBlueprint, ApiError> {
 }
 
 fn quest_prompt(build_prompt: &str, track: &str, difficulty: &Difficulty) -> String {
+    let nonce = Uuid::new_v4();
     format!(
-        r#"You are VibeQuest's quick quest compiler.
+        r#"You are VibeQuest's AI quest compiler for a vibecoding learning product.
 
-Create one tiny learning quest for this vibecoded build request:
+Create one original practical coding quest for this exact learner request:
 "{build_prompt}"
 
 Skill track: {track}
 Difficulty: {difficulty:?}
+Variation seed: {nonce}
 
-Return a fast, compact quest. Use exactly 3 comprehension gates: Explain, Verify, Ship. Use exactly 2 workbench files: one short TypeScript implementation file and one short TypeScript test file. Keep every file under 55 lines. Include CKB/Fiber proof language, an unpaid/invalid denial path, and a replay-safe run binding. No long prose."#
+Hard requirements:
+- The quest must be clearly specific to the learner request. Do not reuse a generic paywall verifier unless the request is actually about a paywall.
+- The code must be concrete and runnable-looking, not placeholder pseudocode.
+- Use exactly 3 comprehension gates: Explain, Verify, Ship.
+- Use exactly 2 workbench files: one short implementation file and one short test file.
+- Keep each file under 80 lines.
+- Include at least one CKB/Fiber concept relevant to the prompt: cell, script, xUDT, proof receipt, Fiber invoice, HTLC, channel state, or payout split.
+- Include a denial/failure path test, such as invalid proof, unpaid access, replayed receipt, wrong witness, wrong asset, or expired timelock.
+- Include a unique run/request-specific constant or fixture so repeated generations are visibly different.
+
+Return only the JSON object required by the schema."#
     )
 }
 
@@ -2068,7 +2007,8 @@ impl IntoResponse for ApiError {
             ApiError::OpenAiTransport(_)
             | ApiError::OpenAiStatus { .. }
             | ApiError::InvalidAiResponse => StatusCode::BAD_GATEWAY,
-            ApiError::Database(_) | ApiError::FiberPayout(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Database(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::FiberPayout(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         (
@@ -2211,30 +2151,6 @@ mod tests {
     }
 
     #[test]
-    fn fallback_quest_contains_verifiable_workspace() {
-        let request = GenerateQuestRequest {
-            build_prompt: "Build a Fiber paid-content app with CKB proof receipts".to_string(),
-            skill_track: Some("Fiber Builder".to_string()),
-            difficulty: Some(Difficulty::Builder),
-            wallet: joyid_wallet_fixture(),
-        };
-
-        let quest = fallback_quest_blueprint(&request, Uuid::nil());
-        let haystack = quest
-            .workbench_files
-            .iter()
-            .map(|file| file.content.to_lowercase())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert_eq!(quest.workbench_files.len(), 2);
-        assert!(haystack.contains("blocks unpaid reads"));
-        assert!(haystack.contains("rejects replayed receipts"));
-        assert!(haystack.contains("fiber"));
-        assert!(haystack.contains("ckb"));
-    }
-
-    #[test]
     fn schema_requires_expected_fields() {
         let schema = quest_json_schema();
         let required = schema
@@ -2305,8 +2221,16 @@ mod tests {
             store: MongoStore::disabled(),
         };
 
+        let integrations = IntegrationStatus {
+            openai: true,
+            ckb_rpc: false,
+            fiber_rpc: false,
+            fiber_payout: false,
+            mongodb: false,
+        };
+
         assert_eq!(
-            missing_integrations(&state),
+            missing_integrations(&state, &integrations),
             vec!["CKB_RPC_URL", "FIBER_RPC_URL", "MONGODB_URI"]
         );
     }
@@ -2378,15 +2302,34 @@ mod tests {
     }
 
     fn quest_run_fixture() -> QuestRunDocument {
-        let quest = fallback_quest_blueprint(
-            &GenerateQuestRequest {
-                build_prompt: "Build a Fiber paid-content app with CKB proof receipts".to_string(),
-                skill_track: Some("Fiber Builder".to_string()),
-                difficulty: Some(Difficulty::Builder),
-                wallet: joyid_wallet_fixture(),
-            },
-            Uuid::nil(),
-        );
+        let quest = QuestBlueprint {
+            title: "AI Fiber Receipt Run".to_string(),
+            premise: "A learner validates a Fiber payment receipt against a CKB proof badge.".to_string(),
+            build_objective: "Build a Fiber paid-content app with CKB proof receipts".to_string(),
+            comprehension_gates: vec![
+                "Explain the JoyID, Fiber receipt, and CKB proof trust boundary.".to_string(),
+                "Verify that unpaid reads and replayed receipts are rejected.".to_string(),
+                "Ship only after the badge and payout claim are defended.".to_string(),
+            ],
+            boss_fight: "A reader replays a receipt from another run. Identify the missing run binding.".to_string(),
+            reward_logic: "CKB stores the proof badge and Fiber invoice-bound reward claim.".to_string(),
+            ckb_fiber_hooks: vec![
+                "CKB proof hash binds the quest receipt.".to_string(),
+                "Fiber invoice binds the payout claim.".to_string(),
+            ],
+            workbench_files: vec![
+                WorkbenchFile {
+                    path: "src/receiptVerifier.ts".to_string(),
+                    language: "ts".to_string(),
+                    content: "export function canRead(receipt?: { runId: string; fiber: string; ckbProof: string }) { return Boolean(receipt && receipt.runId === 'vq-test' && receipt.fiber && receipt.ckbProof.startsWith('0x')); }".to_string(),
+                },
+                WorkbenchFile {
+                    path: "tests/receiptVerifier.test.ts".to_string(),
+                    language: "test.ts".to_string(),
+                    content: "test('blocks unpaid reads', () => expect(canRead()).toBe(false)); test('rejects replayed receipts', () => expect(canRead({ runId: 'old', fiber: 'preimage', ckbProof: '0xabc' })).toBe(false));".to_string(),
+                },
+            ],
+        };
         let now = BsonDateTime::now();
         QuestRunDocument {
             run_id: Uuid::nil().to_string(),
@@ -2394,7 +2337,7 @@ mod tests {
             build_prompt: "Build a Fiber paid-content app with CKB proof receipts".to_string(),
             skill_track: "Fiber Builder".to_string(),
             difficulty: "builder".to_string(),
-            source: QuestSource::CoreFallback,
+            source: QuestSource::OpenAi,
             wallet: WalletBinding {
                 address: "ckt1qjoyidvibequestwalletproof000000000000000000000000000".to_string(),
                 identity: "identity".to_string(),
