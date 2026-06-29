@@ -135,6 +135,16 @@ struct GenerateQuestRequest {
     skill_track: Option<String>,
     difficulty: Option<Difficulty>,
     wallet: WalletProof,
+    learning_context: Option<LearningQuestLink>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LearningQuestLink {
+    module_id: String,
+    lesson_id: String,
+    module_title: String,
+    lesson_title: String,
+    checkpoint_question: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +347,7 @@ enum ReasoningEffort {
 struct GenerateQuestResponse {
     run_id: Uuid,
     source: QuestSource,
+    learning_context: Option<LearningQuestLink>,
     wallet: WalletBinding,
     quest: QuestBlueprint,
     ship_requirements: ShipRequirements,
@@ -508,6 +519,7 @@ struct QuestRunDocument {
     build_prompt: String,
     skill_track: String,
     difficulty: String,
+    learning_context: Option<LearningQuestLink>,
     source: QuestSource,
     wallet: WalletBinding,
     quest: QuestBlueprint,
@@ -674,6 +686,7 @@ struct QuestRunRecord {
     build_prompt: String,
     skill_track: String,
     difficulty: String,
+    learning_context: Option<LearningQuestLink>,
     source: QuestSource,
     quest: QuestBlueprint,
     ship_requirements: ShipRequirements,
@@ -788,6 +801,10 @@ impl MongoStore {
                 .trim()
                 .to_string(),
             difficulty: difficulty_label(request.difficulty.as_ref()).to_string(),
+            learning_context: request
+                .learning_context
+                .clone()
+                .map(compact_learning_quest_link),
             source: response.source,
             wallet: response.wallet.clone(),
             quest: response.quest.clone(),
@@ -1233,6 +1250,7 @@ impl From<QuestRunDocument> for QuestRunRecord {
             build_prompt: run.build_prompt,
             skill_track: run.skill_track,
             difficulty: run.difficulty,
+            learning_context: run.learning_context,
             source: run.source,
             quest: run.quest,
             ship_requirements: run.ship_requirements,
@@ -1544,7 +1562,12 @@ impl OpenAiClient {
             .as_deref()
             .unwrap_or("CKB + Fiber Builder");
 
-        let prompt = quest_prompt(request.build_prompt.trim(), track, &difficulty);
+        let prompt = quest_prompt(
+            request.build_prompt.trim(),
+            track,
+            &difficulty,
+            request.learning_context.as_ref(),
+        );
         let body = serde_json::json!({
             "model": self.model,
             "input": prompt,
@@ -1940,10 +1963,15 @@ async fn generate_quest(
         .await
         .and_then(compact_quest_blueprint)?;
     let source = QuestSource::OpenAi;
+    let learning_context = request
+        .learning_context
+        .clone()
+        .map(compact_learning_quest_link);
 
     let mut response = GenerateQuestResponse {
         run_id,
         source,
+        learning_context,
         wallet: WalletBinding {
             address: request.wallet.address.trim().to_string(),
             identity: request.wallet.signature.identity.trim().to_string(),
@@ -2374,6 +2402,16 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
     Ok(quest)
 }
 
+fn compact_learning_quest_link(link: LearningQuestLink) -> LearningQuestLink {
+    LearningQuestLink {
+        module_id: clamp_text(link.module_id, 120),
+        lesson_id: clamp_text(link.lesson_id, 120),
+        module_title: clamp_text(link.module_title, 140),
+        lesson_title: clamp_text(link.lesson_title, 140),
+        checkpoint_question: clamp_text(link.checkpoint_question, 260),
+    }
+}
+
 fn wallet_binding_from_proof(wallet: &WalletProof) -> WalletBinding {
     WalletBinding {
         address: wallet.address.trim().to_string(),
@@ -2777,8 +2815,25 @@ fn is_learning_only_prompt(prompt: &str) -> bool {
         && !build_terms.iter().any(|term| normalized.contains(term))
 }
 
-fn quest_prompt(build_prompt: &str, track: &str, difficulty: &Difficulty) -> String {
+fn quest_prompt(
+    build_prompt: &str,
+    track: &str,
+    difficulty: &Difficulty,
+    learning_context: Option<&LearningQuestLink>,
+) -> String {
     let nonce = Uuid::new_v4();
+    let learning_context = learning_context
+        .map(|context| {
+            format!(
+                "Learning source: module '{module}' ({module_id}), lesson '{lesson}' ({lesson_id}), checkpoint '{checkpoint}'.",
+                module = context.module_title,
+                module_id = context.module_id,
+                lesson = context.lesson_title,
+                lesson_id = context.lesson_id,
+                checkpoint = context.checkpoint_question,
+            )
+        })
+        .unwrap_or_else(|| "Learning source: direct quest request.".to_string());
     format!(
         r#"Return minified JSON only for a VibeQuest vibecoding learning quest.
 No markdown. No prose outside JSON.
@@ -2786,10 +2841,12 @@ No markdown. No prose outside JSON.
 Request: {build_prompt}
 Skill track: {track}
 Difficulty: {difficulty:?}
+{learning_context}
 Variation seed: {nonce}
 
 Keys exactly: title,premise,build_objective,comprehension_gates,boss_fight,reward_logic,ckb_fiber_hooks,workbench_files.
 Rules:
+- Specific to Request and Learning source; if a lesson source is present, build the quest from that lesson instead of a generic prompt.
 - Specific to Request; do not reuse paywall/verifier themes unless requested.
 - comprehension_gates: exactly 3 short strings named Explain, Verify, Ship.
 - ckb_fiber_hooks: 1-2 short strings.
@@ -3353,6 +3410,7 @@ Done.",
             build_prompt: "Build a Fiber paid-content app with CKB proof receipts".to_string(),
             skill_track: "Fiber Builder".to_string(),
             difficulty: "builder".to_string(),
+            learning_context: None,
             source: QuestSource::OpenAi,
             wallet: WalletBinding {
                 address: "ckt1qjoyidvibequestwalletproof000000000000000000000000000".to_string(),
