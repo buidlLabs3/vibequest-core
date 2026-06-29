@@ -1177,7 +1177,10 @@ impl OpenAiClient {
             .unwrap_or(SERVERLESS_OPENAI_TIMEOUT_SECONDS);
 
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .user_agent("VibeQuestCore/1.0 (+https://github.com/buidlLabs3/vibequest-core)")
+                .build()
+                .expect("OpenAI HTTP client should build"),
             api_key: optional_env("OPENAI_API_KEY"),
             model: optional_env("OPENAI_MODEL")
                 .or_else(|| optional_env("MODEL"))
@@ -1222,9 +1225,7 @@ impl OpenAiClient {
                 "format": quest_json_schema()
             }
         });
-        let timeout = self
-            .timeout
-            .min(Duration::from_secs(SERVERLESS_OPENAI_TIMEOUT_SECONDS));
+        let timeout = self.timeout;
 
         let response = self
             .http
@@ -1530,7 +1531,10 @@ async fn generate_quest(
         }
         Err(error @ (ApiError::Database(_) | ApiError::DatabaseUnavailable)) => {
             warn!(%error, "quest generated but persistence is degraded");
-            return Err(error);
+            response.persistence.warning = Some(
+                "AI quest generated, but cloud save is temporarily unavailable. You can practice now; reward claim unlocks after persistence recovers."
+                    .to_string(),
+            );
         }
         Err(error) => return Err(error),
     }
