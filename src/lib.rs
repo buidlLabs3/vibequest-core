@@ -220,6 +220,86 @@ struct LearningTutorAiResponse {
     references: Vec<LearningResource>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LearningTutorMessage {
+    id: String,
+    role: String,
+    text: String,
+    why: Option<String>,
+    follow_up: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LearningSessionDocument {
+    #[serde(rename = "_id")]
+    id: String,
+    user_address: String,
+    wallet: WalletBinding,
+    source: QuestSource,
+    module: LearningModule,
+    selected_interests: Vec<String>,
+    learner_goal: String,
+    background: String,
+    pace: String,
+    active_lesson_index: i64,
+    checkpoint_answers: Document,
+    tutor_messages: Vec<LearningTutorMessage>,
+    created_at: BsonDateTime,
+    updated_at: BsonDateTime,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveLearningSessionRequest {
+    wallet: WalletProof,
+    module_id: Option<String>,
+    module: LearningModule,
+    selected_interests: Vec<String>,
+    learner_goal: String,
+    background: String,
+    pace: String,
+    active_lesson_index: usize,
+    checkpoint_answers: std::collections::BTreeMap<String, i64>,
+    tutor_messages: Vec<LearningTutorMessage>,
+}
+
+#[derive(Debug, Serialize)]
+struct LearningSessionResponse {
+    session: Option<LearningSessionRecord>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LearningSessionRecord {
+    module_id: String,
+    user_address: String,
+    source: QuestSource,
+    module: LearningModule,
+    selected_interests: Vec<String>,
+    learner_goal: String,
+    background: String,
+    pace: String,
+    active_lesson_index: usize,
+    checkpoint_answers: std::collections::BTreeMap<String, i64>,
+    tutor_messages: Vec<LearningTutorMessage>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveTutorExchangeRequest {
+    wallet: WalletProof,
+    module_title: String,
+    lesson_title: String,
+    lesson_context: String,
+    question: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SavedTutorExchangeResponse {
+    answer: LearningTutorResponse,
+    session: Option<LearningSessionRecord>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct WalletProof {
     address: String,
@@ -679,6 +759,10 @@ impl MongoStore {
         Ok(self.database().await?.collection("reward_claims"))
     }
 
+    async fn learning_sessions(&self) -> Result<Collection<LearningSessionDocument>, ApiError> {
+        Ok(self.database().await?.collection("learning_sessions"))
+    }
+
     async fn record_generated_quest(
         &self,
         request: &GenerateQuestRequest,
@@ -810,6 +894,127 @@ impl MongoStore {
             runs: records,
             reward_claims,
         })
+    }
+
+    async fn get_learning_session(
+        &self,
+        address: &str,
+    ) -> Result<Option<LearningSessionRecord>, ApiError> {
+        let address = address.trim();
+        if address.is_empty() {
+            return Err(ApiError::MissingWalletAddress);
+        }
+
+        let document = self
+            .learning_sessions()
+            .await?
+            .find_one(doc! { "user_address": address })
+            .await?;
+
+        Ok(document.map(LearningSessionRecord::from))
+    }
+
+    async fn save_learning_session(
+        &self,
+        address: &str,
+        request: SaveLearningSessionRequest,
+    ) -> Result<LearningSessionRecord, ApiError> {
+        validate_wallet_proof(&request.wallet)?;
+        let address = address.trim();
+        if address.is_empty() {
+            return Err(ApiError::MissingWalletAddress);
+        }
+        if request.wallet.address.trim() != address {
+            return Err(ApiError::WalletMismatch);
+        }
+
+        let wallet = wallet_binding_from_proof(&request.wallet);
+        self.upsert_user(&wallet).await?;
+
+        let module = compact_learning_module(request.module)?;
+        let sessions = self.learning_sessions().await?;
+        let existing = sessions.find_one(doc! { "user_address": address }).await?;
+        let now = BsonDateTime::now();
+        let id = request
+            .module_id
+            .filter(|module_id| !module_id.trim().is_empty())
+            .or_else(|| existing.as_ref().map(|session| session.id.clone()))
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let created_at = existing
+            .as_ref()
+            .map(|session| session.created_at)
+            .unwrap_or(now);
+        let document = LearningSessionDocument {
+            id: id.clone(),
+            user_address: address.to_string(),
+            wallet,
+            source: QuestSource::OpenAi,
+            module,
+            selected_interests: compact_string_list(request.selected_interests, 8, 80),
+            learner_goal: clamp_text(request.learner_goal, 360),
+            background: clamp_text(request.background, 80),
+            pace: clamp_text(request.pace, 80),
+            active_lesson_index: request.active_lesson_index.min(20) as i64,
+            checkpoint_answers: checkpoint_answers_document(request.checkpoint_answers),
+            tutor_messages: compact_tutor_messages(request.tutor_messages),
+            created_at,
+            updated_at: now,
+        };
+
+        sessions
+            .replace_one(doc! { "user_address": address }, &document)
+            .upsert(true)
+            .await?;
+
+        Ok(document.into())
+    }
+
+    async fn append_tutor_exchange(
+        &self,
+        address: &str,
+        request: &SaveTutorExchangeRequest,
+        answer: &LearningTutorResponse,
+    ) -> Result<Option<LearningSessionRecord>, ApiError> {
+        if !self.is_configured() {
+            return Ok(None);
+        }
+
+        let address = address.trim();
+        let mut session = match self
+            .learning_sessions()
+            .await?
+            .find_one(doc! { "user_address": address })
+            .await?
+        {
+            Some(session) => session,
+            None => return Ok(None),
+        };
+        let now = Utc::now();
+        session.tutor_messages.push(LearningTutorMessage {
+            id: format!("learner-{}", now.timestamp_millis()),
+            role: "learner".to_string(),
+            text: clamp_text(request.question.clone(), 900),
+            why: None,
+            follow_up: None,
+            created_at: now,
+        });
+        session.tutor_messages.push(LearningTutorMessage {
+            id: format!("mentor-{}", now.timestamp_millis()),
+            role: "mentor".to_string(),
+            text: answer.answer.clone(),
+            why: Some(answer.why_it_matters.clone()),
+            follow_up: Some(answer.follow_up_question.clone()),
+            created_at: now,
+        });
+        session.tutor_messages = compact_tutor_messages(session.tutor_messages);
+        session.updated_at = BsonDateTime::now();
+
+        self.learning_sessions()
+            .await?
+            .replace_one(doc! { "_id": &session.id }, &session)
+            .await?;
+
+        Ok(Some(session.into()))
     }
 
     async fn get_run(&self, run_id: &str) -> Result<QuestRunDocument, ApiError> {
@@ -1041,6 +1246,26 @@ impl From<QuestRunDocument> for QuestRunRecord {
     }
 }
 
+impl From<LearningSessionDocument> for LearningSessionRecord {
+    fn from(session: LearningSessionDocument) -> Self {
+        Self {
+            module_id: session.id,
+            user_address: session.user_address,
+            source: session.source,
+            module: session.module,
+            selected_interests: session.selected_interests,
+            learner_goal: session.learner_goal,
+            background: session.background,
+            pace: session.pace,
+            active_lesson_index: session.active_lesson_index.max(0) as usize,
+            checkpoint_answers: document_to_checkpoint_answers(session.checkpoint_answers),
+            tutor_messages: session.tutor_messages,
+            created_at: bson_datetime_to_utc(session.created_at),
+            updated_at: bson_datetime_to_utc(session.updated_at),
+        }
+    }
+}
+
 impl From<RewardClaimDocument> for RewardClaimRecord {
     fn from(claim: RewardClaimDocument) -> Self {
         Self {
@@ -1213,6 +1438,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ready", get(ready))
         .route("/season", get(season))
         .route("/users/{address}/quests", get(list_user_quests))
+        .route(
+            "/users/{address}/learning",
+            get(api_get_learning_session).post(api_save_learning_session),
+        )
+        .route(
+            "/users/{address}/learning/tutor",
+            post(api_save_learning_tutor_exchange),
+        )
         .route("/quests/{run_id}", get(get_quest_run))
         .route("/quests/{run_id}/progress", post(update_quest_progress))
         .route("/quests/{run_id}/complete", post(complete_quest))
@@ -1790,6 +2023,55 @@ async fn answer_learning_question(
     Ok(Json(state.openai.answer_learning_question(&request).await?))
 }
 
+async fn api_get_learning_session(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> Result<Json<LearningSessionResponse>, ApiError> {
+    Ok(Json(LearningSessionResponse {
+        session: state.store.get_learning_session(&address).await?,
+    }))
+}
+
+async fn api_save_learning_session(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+    Json(request): Json<SaveLearningSessionRequest>,
+) -> Result<Json<LearningSessionRecord>, ApiError> {
+    Ok(Json(
+        state.store.save_learning_session(&address, request).await?,
+    ))
+}
+
+async fn api_save_learning_tutor_exchange(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+    Json(request): Json<SaveTutorExchangeRequest>,
+) -> Result<Json<SavedTutorExchangeResponse>, ApiError> {
+    validate_wallet_proof(&request.wallet)?;
+    if request.wallet.address.trim() != address.trim() {
+        return Err(ApiError::WalletMismatch);
+    }
+    if request.question.trim().chars().count() < 4 {
+        return Err(ApiError::InvalidPrompt);
+    }
+
+    let answer = state
+        .openai
+        .answer_learning_question(&LearningTutorRequest {
+            module_title: request.module_title.clone(),
+            lesson_title: request.lesson_title.clone(),
+            lesson_context: request.lesson_context.clone(),
+            question: request.question.clone(),
+        })
+        .await?;
+    let session = state
+        .store
+        .append_tutor_exchange(&address, &request, &answer)
+        .await?;
+
+    Ok(Json(SavedTutorExchangeResponse { answer, session }))
+}
+
 async fn list_user_quests(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
@@ -2090,6 +2372,71 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
     }
 
     Ok(quest)
+}
+
+fn wallet_binding_from_proof(wallet: &WalletProof) -> WalletBinding {
+    WalletBinding {
+        address: wallet.address.trim().to_string(),
+        identity: wallet.signature.identity.trim().to_string(),
+        sign_type: wallet.signature.sign_type.trim().to_string(),
+        message: wallet.message.trim().to_string(),
+    }
+}
+
+fn compact_string_list(values: Vec<String>, limit: usize, max_chars: usize) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| clamp_text(value, max_chars))
+        .filter(|value| !value.trim().is_empty())
+        .take(limit)
+        .collect()
+}
+
+fn checkpoint_answers_document(values: std::collections::BTreeMap<String, i64>) -> Document {
+    let mut document = Document::new();
+    for (key, value) in values.into_iter().take(50) {
+        if !key.trim().is_empty() {
+            document.insert(key, value);
+        }
+    }
+    document
+}
+
+fn document_to_checkpoint_answers(document: Document) -> std::collections::BTreeMap<String, i64> {
+    document
+        .into_iter()
+        .filter_map(|(key, value)| match value {
+            mongodb::bson::Bson::Int32(value) => Some((key, i64::from(value))),
+            mongodb::bson::Bson::Int64(value) => Some((key, value)),
+            mongodb::bson::Bson::Double(value) => Some((key, value as i64)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn compact_tutor_messages(messages: Vec<LearningTutorMessage>) -> Vec<LearningTutorMessage> {
+    messages
+        .into_iter()
+        .filter(|message| {
+            (message.role == "learner" || message.role == "mentor")
+                && !message.text.trim().is_empty()
+        })
+        .map(|message| LearningTutorMessage {
+            id: clamp_text(message.id, 80),
+            role: message.role,
+            text: clamp_text(message.text, 900),
+            why: message.why.map(|why| clamp_text(why, 500)),
+            follow_up: message
+                .follow_up
+                .map(|follow_up| clamp_text(follow_up, 260)),
+            created_at: message.created_at,
+        })
+        .rev()
+        .take(30)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 fn compact_learning_module(mut module: LearningModule) -> Result<LearningModule, ApiError> {
@@ -2820,6 +3167,36 @@ Done.",
             missing_integrations(&state, &integrations),
             vec!["CKB_RPC_URL", "FIBER_RPC_URL", "MONGODB_URI"]
         );
+    }
+
+    #[test]
+    fn checkpoint_answers_round_trip_through_document() {
+        let values = std::collections::BTreeMap::from([
+            ("lesson-1".to_string(), 2_i64),
+            ("lesson-2".to_string(), 0_i64),
+        ]);
+        let document = checkpoint_answers_document(values.clone());
+
+        assert_eq!(document_to_checkpoint_answers(document), values);
+    }
+
+    #[test]
+    fn compact_tutor_messages_keeps_recent_valid_messages() {
+        let now = Utc::now();
+        let messages = (0..40)
+            .map(|index| LearningTutorMessage {
+                id: format!("m-{index}"),
+                role: if index % 2 == 0 { "learner" } else { "mentor" }.to_string(),
+                text: format!("message {index}"),
+                why: None,
+                follow_up: None,
+                created_at: now,
+            })
+            .collect::<Vec<_>>();
+
+        let compacted = compact_tutor_messages(messages);
+        assert_eq!(compacted.len(), 30);
+        assert_eq!(compacted.first().unwrap().id, "m-10");
     }
 
     #[test]
