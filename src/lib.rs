@@ -1966,7 +1966,8 @@ Rules:
 - ckb_fiber_hooks: 1-2 short strings.
 - workbench_files: exactly 2 objects with path,language,content.
 - TypeScript only. Each content <=12 lines, escaped newlines inside JSON strings.
-- Include one denial/failure test that returns false, rejects, or throws.
+- Include one denial/failure test that mutates the exact trusted field from the implementation.
+- Make boss_fight reference the generated function, invariant, and attack/failure case, not a generic reward checklist.
 - Include relevant CKB/Fiber terms: cell, witness, script, xUDT, Fiber invoice, HTLC, channel state, proof, or payout split.
 - Include a unique const or fixture using the variation seed."#
     )
