@@ -30,6 +30,8 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
 const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Minimal;
 const DEFAULT_OPENAI_TIMEOUT_SECONDS: u64 = 52;
 const QUICK_QUEST_OUTPUT_TOKENS: u16 = 520;
+const LEARNING_MODULE_OUTPUT_TOKENS: u16 = 1050;
+const TUTOR_OUTPUT_TOKENS: u16 = 520;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -133,6 +135,89 @@ struct GenerateQuestRequest {
     skill_track: Option<String>,
     difficulty: Option<Difficulty>,
     wallet: WalletProof,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerateLearningModuleRequest {
+    interests: Vec<String>,
+    learner_goal: String,
+    background: String,
+    pace: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenerateLearningModuleResponse {
+    module_id: Uuid,
+    source: QuestSource,
+    module: LearningModule,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LearningModule {
+    title: String,
+    learner_profile: String,
+    outcome: String,
+    lessons: Vec<LearningLesson>,
+    capstone_quest_prompt: String,
+    resources: Vec<LearningResource>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LearningLesson {
+    id: String,
+    title: String,
+    why_it_matters: String,
+    explanation: String,
+    concepts: Vec<String>,
+    checkpoint: LearningCheckpoint,
+    quest_bridge: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LearningCheckpoint {
+    question: String,
+    options: Vec<LearningOption>,
+    correct_index: usize,
+    explanation: String,
+    follow_up_question: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LearningOption {
+    label: String,
+    feedback: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LearningResource {
+    title: String,
+    url: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LearningTutorRequest {
+    module_title: String,
+    lesson_title: String,
+    lesson_context: String,
+    question: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LearningTutorResponse {
+    source: QuestSource,
+    answer: String,
+    why_it_matters: String,
+    follow_up_question: String,
+    references: Vec<LearningResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LearningTutorAiResponse {
+    answer: String,
+    why_it_matters: String,
+    follow_up_question: String,
+    references: Vec<LearningResource>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1132,6 +1217,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/quests/{run_id}/progress", post(update_quest_progress))
         .route("/quests/{run_id}/complete", post(complete_quest))
         .route("/ai/quests/generate", post(generate_quest))
+        .route("/ai/learning/module", post(generate_learning_module))
+        .route("/ai/learning/tutor", post(answer_learning_question))
         .layer(cors_layer(&state.config))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1282,6 +1369,114 @@ impl OpenAiClient {
             .map_err(|_| ApiError::InvalidAiResponse)?;
 
         parse_openai_quest_response(response)
+    }
+
+    async fn generate_learning_module(
+        &self,
+        request: &GenerateLearningModuleRequest,
+    ) -> Result<LearningModule, ApiError> {
+        let Some(api_key) = self.api_key.as_ref() else {
+            return Err(ApiError::MissingOpenAiKey);
+        };
+
+        let prompt = learning_module_prompt(request);
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": prompt,
+            "reasoning": {
+                "effort": self.reasoning_effort.serverless_safe()
+            },
+            "max_output_tokens": LEARNING_MODULE_OUTPUT_TOKENS,
+            "store": !self.disable_response_storage,
+            "text": {
+                "format": {
+                    "type": "json_object"
+                }
+            }
+        });
+
+        let response = self
+            .http
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(api_key)
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ApiError::OpenAiTransport(error.to_string()))?;
+
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .map_err(|error| ApiError::OpenAiTransport(error.to_string()))?;
+
+        if !status.is_success() {
+            return Err(ApiError::OpenAiStatus {
+                status,
+                body: truncate_error_body(&response_body),
+            });
+        }
+
+        parse_openai_json_response::<LearningModule>(&response_body)
+            .and_then(compact_learning_module)
+    }
+
+    async fn answer_learning_question(
+        &self,
+        request: &LearningTutorRequest,
+    ) -> Result<LearningTutorResponse, ApiError> {
+        let Some(api_key) = self.api_key.as_ref() else {
+            return Err(ApiError::MissingOpenAiKey);
+        };
+
+        let prompt = learning_tutor_prompt(request);
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": prompt,
+            "reasoning": {
+                "effort": self.reasoning_effort.serverless_safe()
+            },
+            "max_output_tokens": TUTOR_OUTPUT_TOKENS,
+            "store": !self.disable_response_storage,
+            "text": {
+                "format": {
+                    "type": "json_object"
+                }
+            }
+        });
+
+        let response = self
+            .http
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(api_key)
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ApiError::OpenAiTransport(error.to_string()))?;
+
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .map_err(|error| ApiError::OpenAiTransport(error.to_string()))?;
+
+        if !status.is_success() {
+            return Err(ApiError::OpenAiStatus {
+                status,
+                body: truncate_error_body(&response_body),
+            });
+        }
+
+        let answer = parse_openai_json_response::<LearningTutorAiResponse>(&response_body)?;
+        Ok(LearningTutorResponse {
+            source: QuestSource::OpenAi,
+            answer: clamp_text(answer.answer, 900),
+            why_it_matters: clamp_text(answer.why_it_matters, 500),
+            follow_up_question: clamp_text(answer.follow_up_question, 220),
+            references: compact_learning_resources(answer.references),
+        })
     }
 }
 
@@ -1565,6 +1760,34 @@ async fn generate_quest(
 
 fn persistence_degraded_warning() -> String {
     "AI quest generated, but cloud save is temporarily unavailable. You can practice now; reward claim unlocks after persistence recovers.".to_string()
+}
+
+async fn generate_learning_module(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GenerateLearningModuleRequest>,
+) -> Result<Json<GenerateLearningModuleResponse>, ApiError> {
+    if request.learner_goal.trim().chars().count() < 8 && request.interests.is_empty() {
+        return Err(ApiError::InvalidPrompt);
+    }
+
+    let module = state.openai.generate_learning_module(&request).await?;
+
+    Ok(Json(GenerateLearningModuleResponse {
+        module_id: Uuid::new_v4(),
+        source: QuestSource::OpenAi,
+        module,
+    }))
+}
+
+async fn answer_learning_question(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<LearningTutorRequest>,
+) -> Result<Json<LearningTutorResponse>, ApiError> {
+    if request.question.trim().chars().count() < 4 {
+        return Err(ApiError::InvalidPrompt);
+    }
+
+    Ok(Json(state.openai.answer_learning_question(&request).await?))
 }
 
 async fn list_user_quests(
@@ -1869,6 +2092,131 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
     Ok(quest)
 }
 
+fn compact_learning_module(mut module: LearningModule) -> Result<LearningModule, ApiError> {
+    module.title = clamp_text(module.title, 80);
+    module.learner_profile = clamp_text(module.learner_profile, 180);
+    module.outcome = clamp_text(module.outcome, 220);
+    module.capstone_quest_prompt = clamp_text(module.capstone_quest_prompt, 360);
+
+    if module.lessons.len() > 5 {
+        module.lessons.truncate(5);
+    }
+
+    if module.lessons.len() < 3 {
+        return Err(ApiError::InvalidAiResponse);
+    }
+
+    for (index, lesson) in module.lessons.iter_mut().enumerate() {
+        if lesson.id.trim().is_empty() {
+            lesson.id = format!("lesson-{}", index + 1);
+        }
+        lesson.title = clamp_text(lesson.title.clone(), 80);
+        lesson.why_it_matters = clamp_text(lesson.why_it_matters.clone(), 260);
+        lesson.explanation = clamp_text(lesson.explanation.clone(), 1000);
+        lesson.quest_bridge = clamp_text(lesson.quest_bridge.clone(), 280);
+        if lesson.concepts.len() > 5 {
+            lesson.concepts.truncate(5);
+        }
+        lesson.concepts = lesson
+            .concepts
+            .iter()
+            .map(|concept| clamp_text(concept.clone(), 80))
+            .filter(|concept| !concept.trim().is_empty())
+            .collect();
+        if lesson.concepts.is_empty() {
+            lesson.concepts.push("CKB/Fiber trust boundary".to_string());
+        }
+
+        if lesson.checkpoint.options.len() > 4 {
+            lesson.checkpoint.options.truncate(4);
+        }
+        while lesson.checkpoint.options.len() < 4 {
+            lesson.checkpoint.options.push(LearningOption {
+                label: "Not enough information to defend the system.".to_string(),
+                feedback: "A strong answer must name the trusted state and the failure case."
+                    .to_string(),
+            });
+        }
+        if lesson.checkpoint.correct_index >= lesson.checkpoint.options.len() {
+            lesson.checkpoint.correct_index = 0;
+        }
+        lesson.checkpoint.question = clamp_text(lesson.checkpoint.question.clone(), 260);
+        lesson.checkpoint.explanation = clamp_text(lesson.checkpoint.explanation.clone(), 500);
+        lesson.checkpoint.follow_up_question =
+            clamp_text(lesson.checkpoint.follow_up_question.clone(), 260);
+        for option in &mut lesson.checkpoint.options {
+            option.label = clamp_text(option.label.clone(), 220);
+            option.feedback = clamp_text(option.feedback.clone(), 280);
+        }
+
+        if lesson.title.trim().is_empty()
+            || lesson.explanation.trim().is_empty()
+            || lesson.checkpoint.question.trim().is_empty()
+        {
+            return Err(ApiError::InvalidAiResponse);
+        }
+    }
+
+    module.resources = compact_learning_resources(module.resources);
+    if module.resources.is_empty() {
+        module.resources = default_learning_resources();
+    }
+
+    Ok(module)
+}
+
+fn compact_learning_resources(resources: Vec<LearningResource>) -> Vec<LearningResource> {
+    let mut compacted = resources
+        .into_iter()
+        .filter(|resource| resource.title.trim().len() > 1 && resource.url.starts_with("https://"))
+        .map(|resource| LearningResource {
+            title: clamp_text(resource.title, 80),
+            url: clamp_text(resource.url, 160),
+            reason: clamp_text(resource.reason, 180),
+        })
+        .take(4)
+        .collect::<Vec<_>>();
+
+    if compacted.is_empty() {
+        compacted = default_learning_resources();
+    }
+
+    compacted
+}
+
+fn default_learning_resources() -> Vec<LearningResource> {
+    vec![
+        LearningResource {
+            title: "CKB Docs".to_string(),
+            url: "https://docs.nervos.org/".to_string(),
+            reason: "Reference cells, scripts, witnesses, transactions, and token state."
+                .to_string(),
+        },
+        LearningResource {
+            title: "Fiber Network Repository".to_string(),
+            url: "https://github.com/nervosnetwork/fiber".to_string(),
+            reason: "Reference payment channels, invoices, HTLCs, routing, and node behavior."
+                .to_string(),
+        },
+        LearningResource {
+            title: "JoyID Documentation".to_string(),
+            url: "https://docs.joy.id/".to_string(),
+            reason: "Reference passkey wallet flows and signer identity assumptions.".to_string(),
+        },
+    ]
+}
+
+fn clamp_text(value: String, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let mut output = trimmed.chars().take(max_chars).collect::<String>();
+    output.push_str("...");
+    output
+}
+
 fn infer_workbench_language(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or_default() {
         "rs" => "rust",
@@ -1890,9 +2238,22 @@ fn compact_file_content(content: &str, max_lines: usize) -> String {
     compacted
 }
 
-fn parse_openai_quest_response(response: OpenAiResponse) -> Result<QuestBlueprint, ApiError> {
+fn parse_openai_json_response<T>(body: &str) -> Result<T, ApiError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let response =
+        serde_json::from_str::<OpenAiResponse>(body).map_err(|_| ApiError::InvalidAiResponse)?;
+    let text = openai_response_text(response)?;
+    let trimmed = text.trim();
+    let json = extract_json_object(trimmed).unwrap_or(trimmed);
+
+    serde_json::from_str::<T>(json).map_err(|_| ApiError::InvalidAiResponse)
+}
+
+fn openai_response_text(response: OpenAiResponse) -> Result<String, ApiError> {
     if let Some(output_text) = response.output_text {
-        return parse_quest_json(&output_text);
+        return Ok(output_text);
     }
 
     let text = response
@@ -1913,7 +2274,11 @@ fn parse_openai_quest_response(response: OpenAiResponse) -> Result<QuestBlueprin
         return Err(ApiError::InvalidAiResponse);
     }
 
-    parse_quest_json(&text)
+    Ok(text)
+}
+
+fn parse_openai_quest_response(response: OpenAiResponse) -> Result<QuestBlueprint, ApiError> {
+    parse_quest_json(&openai_response_text(response)?)
 }
 
 fn parse_quest_json(text: &str) -> Result<QuestBlueprint, ApiError> {
@@ -1955,6 +2320,73 @@ fn extract_json_object(text: &str) -> Option<&str> {
     }
 
     None
+}
+
+fn learning_module_prompt(request: &GenerateLearningModuleRequest) -> String {
+    let nonce = Uuid::new_v4();
+    let interests = request
+        .interests
+        .iter()
+        .map(|interest| interest.trim())
+        .filter(|interest| !interest.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let interests = if interests.is_empty() {
+        "CKB foundations, Fiber payments, JoyID wallet UX".to_string()
+    } else {
+        interests
+    };
+
+    format!(
+        r#"Return minified JSON only for a VibeQuest adaptive learning module.
+No markdown. No prose outside JSON.
+
+Learner interests: {interests}
+Learner goal: {goal}
+Learner background: {background}
+Pace: {pace}
+Variation seed: {nonce}
+
+Keys exactly: title,learner_profile,outcome,lessons,capstone_quest_prompt,resources.
+Rules:
+- This is a learning module, not a coding quest. Teach deeply before asking them to build.
+- lessons: 3-5 objects with keys id,title,why_it_matters,explanation,concepts,checkpoint,quest_bridge.
+- Each lesson must explain a CKB/Fiber/JoyID concept in practical language and connect it to a real builder, auditor, researcher, or community scenario.
+- Each checkpoint has keys question,options,correct_index,explanation,follow_up_question.
+- options: exactly 4 objects with label and feedback. Wrong options must be plausible misunderstandings and feedback must explain why.
+- correct_index must vary across lessons; do not make every answer A.
+- capstone_quest_prompt must be a specific code quest prompt based on the lessons completed.
+- resources: 3-4 authoritative links. Prefer https://docs.nervos.org/, https://github.com/nervosnetwork/fiber, https://docs.joy.id/, and relevant Nervos standards docs.
+- Keep lesson explanations compact but substantive: trust assumptions, common vibecoding mistake, and a concrete check the learner can perform."#,
+        goal = request.learner_goal.trim(),
+        background = request.background.trim(),
+        pace = request.pace.trim(),
+    )
+}
+
+fn learning_tutor_prompt(request: &LearningTutorRequest) -> String {
+    format!(
+        r#"Return minified JSON only.
+No markdown. No prose outside JSON.
+
+Module: {module}
+Lesson: {lesson}
+Lesson context: {context}
+Learner question: {question}
+
+Keys exactly: answer,why_it_matters,follow_up_question,references.
+Rules:
+- Answer as a patient senior CKB/Fiber tutor.
+- Explain the concept directly, then name the common vibecoding misunderstanding.
+- If the learner is wrong or vague, explain why and ask a different related follow-up question.
+- references: 2-3 authoritative links with title,url,reason. Prefer CKB Docs, Fiber repo, JoyID docs when relevant.
+- Keep answer under 160 words."#,
+        module = request.module_title.trim(),
+        lesson = request.lesson_title.trim(),
+        context = request.lesson_context.trim(),
+        question = request.question.trim(),
+    )
 }
 
 fn is_learning_only_prompt(prompt: &str) -> bool {
@@ -2388,6 +2820,44 @@ Done.",
             missing_integrations(&state, &integrations),
             vec!["CKB_RPC_URL", "FIBER_RPC_URL", "MONGODB_URI"]
         );
+    }
+
+    #[test]
+    fn compact_learning_module_keeps_checkpoint_options() {
+        let module = LearningModule {
+            title: "CKB Cell Foundations".to_string(),
+            learner_profile: "Vibecoder learning CKB".to_string(),
+            outcome: "Explain cells and ship a small verifier quest.".to_string(),
+            lessons: (0..3)
+                .map(|index| LearningLesson {
+                    id: format!("lesson-{index}"),
+                    title: "Cells as state".to_string(),
+                    why_it_matters: "Cells are the state a verifier trusts.".to_string(),
+                    explanation: "A CKB cell is consumed and recreated, so generated code must bind witnesses to the expected cell state.".to_string(),
+                    concepts: vec!["cell".to_string(), "witness".to_string()],
+                    checkpoint: LearningCheckpoint {
+                        question: "What should the verifier bind?".to_string(),
+                        options: vec![
+                            LearningOption { label: "The exact cell and witness".to_string(), feedback: "Correct.".to_string() },
+                            LearningOption { label: "Only the UI state".to_string(), feedback: "UI state is not proof.".to_string() },
+                            LearningOption { label: "Only the reward amount".to_string(), feedback: "Amount is not identity.".to_string() },
+                            LearningOption { label: "Nothing".to_string(), feedback: "That leaves replay risk.".to_string() },
+                        ],
+                        correct_index: index as usize % 4,
+                        explanation: "The witness must match the accepted cell state.".to_string(),
+                        follow_up_question: "How would a replay attack change the cell?".to_string(),
+                    },
+                    quest_bridge: "Build a verifier that rejects mismatched witnesses.".to_string(),
+                })
+                .collect(),
+            capstone_quest_prompt: "Build a CKB witness verifier with a denial test.".to_string(),
+            resources: vec![],
+        };
+
+        let compacted = compact_learning_module(module).unwrap();
+        assert_eq!(compacted.lessons.len(), 3);
+        assert_eq!(compacted.lessons[0].checkpoint.options.len(), 4);
+        assert!(!compacted.resources.is_empty());
     }
 
     #[test]
