@@ -28,8 +28,8 @@ use uuid::Uuid;
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
 const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Minimal;
-const SERVERLESS_OPENAI_TIMEOUT_SECONDS: u64 = 12;
-const QUICK_QUEST_OUTPUT_TOKENS: u16 = 900;
+const DEFAULT_OPENAI_TIMEOUT_SECONDS: u64 = 52;
+const QUICK_QUEST_OUTPUT_TOKENS: u16 = 520;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -209,17 +209,24 @@ struct ShipRequirements {
 struct QuestBlueprint {
     title: String,
     premise: String,
+    #[serde(alias = "buildObjective")]
     build_objective: String,
+    #[serde(alias = "comprehensionGates")]
     comprehension_gates: Vec<String>,
+    #[serde(alias = "bossFight")]
     boss_fight: String,
+    #[serde(alias = "rewardLogic")]
     reward_logic: String,
+    #[serde(alias = "ckbFiberHooks", default)]
     ckb_fiber_hooks: Vec<String>,
+    #[serde(alias = "workbenchFiles")]
     workbench_files: Vec<WorkbenchFile>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct WorkbenchFile {
     path: String,
+    #[serde(default)]
     language: String,
     content: String,
 }
@@ -1174,7 +1181,8 @@ impl OpenAiClient {
         let timeout_seconds = env::var("OPENAI_TIMEOUT_SECONDS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(SERVERLESS_OPENAI_TIMEOUT_SECONDS);
+            .unwrap_or(DEFAULT_OPENAI_TIMEOUT_SECONDS)
+            .min(DEFAULT_OPENAI_TIMEOUT_SECONDS);
 
         Self {
             http: Client::builder()
@@ -1222,7 +1230,9 @@ impl OpenAiClient {
             "max_output_tokens": QUICK_QUEST_OUTPUT_TOKENS,
             "store": !self.disable_response_storage,
             "text": {
-                "format": quest_json_schema()
+                "format": {
+                    "type": "json_object"
+                }
             }
         });
         let timeout = self.timeout;
@@ -1516,30 +1526,36 @@ async fn generate_quest(
         },
     };
 
-    match state
-        .store
-        .record_generated_quest(
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        state.store.record_generated_quest(
             &request,
             &response,
             state.config.reward_amount_shannons,
             &state.config.reward_currency,
-        )
-        .await
+        ),
+    )
+    .await
     {
-        Ok(()) => {
+        Ok(Ok(())) => {
             response.persistence.saved = true;
         }
-        Err(error @ (ApiError::Database(_) | ApiError::DatabaseUnavailable)) => {
+        Ok(Err(error @ (ApiError::Database(_) | ApiError::DatabaseUnavailable))) => {
             warn!(%error, "quest generated but persistence is degraded");
-            response.persistence.warning = Some(
-                "AI quest generated, but cloud save is temporarily unavailable. You can practice now; reward claim unlocks after persistence recovers."
-                    .to_string(),
-            );
+            response.persistence.warning = Some(persistence_degraded_warning());
         }
-        Err(error) => return Err(error),
+        Err(_) => {
+            warn!("quest generated but persistence timed out");
+            response.persistence.warning = Some(persistence_degraded_warning());
+        }
+        Ok(Err(error)) => return Err(error),
     }
 
     Ok(Json(response))
+}
+
+fn persistence_degraded_warning() -> String {
+    "AI quest generated, but cloud save is temporarily unavailable. You can practice now; reward claim unlocks after persistence recovers.".to_string()
 }
 
 async fn list_user_quests(
@@ -1813,6 +1829,11 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
         );
     }
 
+    if quest.ckb_fiber_hooks.is_empty() {
+        quest.ckb_fiber_hooks.push(
+            "Bind the generated proof to CKB cell state and Fiber payment context.".to_string(),
+        );
+    }
     if quest.ckb_fiber_hooks.len() > 2 {
         quest.ckb_fiber_hooks.truncate(2);
     }
@@ -1821,6 +1842,9 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
     }
 
     for file in &mut quest.workbench_files {
+        if file.language.trim().is_empty() {
+            file.language = infer_workbench_language(&file.path).to_string();
+        }
         file.content = compact_file_content(&file.content, 80);
     }
 
@@ -1834,6 +1858,16 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
     }
 
     Ok(quest)
+}
+
+fn infer_workbench_language(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or_default() {
+        "rs" => "rust",
+        "tsx" | "jsx" => "tsx",
+        "ts" | "js" => "typescript",
+        "md" => "markdown",
+        _ => "text",
+    }
 }
 
 fn compact_file_content(content: &str, max_lines: usize) -> String {
@@ -1874,35 +1908,71 @@ fn parse_openai_quest_response(response: OpenAiResponse) -> Result<QuestBlueprin
 }
 
 fn parse_quest_json(text: &str) -> Result<QuestBlueprint, ApiError> {
-    serde_json::from_str::<QuestBlueprint>(text.trim()).map_err(|_| ApiError::InvalidAiResponse)
+    let trimmed = text.trim();
+    let json = extract_json_object(trimmed).unwrap_or(trimmed);
+
+    serde_json::from_str::<QuestBlueprint>(json).map_err(|_| ApiError::InvalidAiResponse)
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, character) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&text[start..start + offset + character.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn quest_prompt(build_prompt: &str, track: &str, difficulty: &Difficulty) -> String {
     let nonce = Uuid::new_v4();
     format!(
-        r#"You are VibeQuest's AI quest compiler for a vibecoding learning product.
+        r#"Return minified JSON only for a VibeQuest vibecoding learning quest.
+No markdown. No prose outside JSON.
 
-Create one original practical coding quest for this exact learner request:
-"{build_prompt}"
-
+Request: {build_prompt}
 Skill track: {track}
 Difficulty: {difficulty:?}
 Variation seed: {nonce}
 
-Hard requirements:
-- The quest must be clearly specific to the learner request. Do not reuse a generic paywall verifier unless the request is actually about a paywall.
-- The code must be concrete and runnable-looking, not placeholder pseudocode.
-- Use exactly 3 comprehension gates: Explain, Verify, Ship.
-- Use exactly 2 workbench files: one short implementation file and one short test file.
-- Keep each file under 80 lines.
-- Include at least one CKB/Fiber concept relevant to the prompt: cell, script, xUDT, proof receipt, Fiber invoice, HTLC, channel state, or payout split.
-- Include a denial/failure path test, such as invalid proof, unpaid access, replayed receipt, wrong witness, wrong asset, or expired timelock.
-- Include a unique run/request-specific constant or fixture so repeated generations are visibly different.
-
-Return only the JSON object required by the schema."#
+Keys exactly: title,premise,build_objective,comprehension_gates,boss_fight,reward_logic,ckb_fiber_hooks,workbench_files.
+Rules:
+- Specific to Request; do not reuse paywall/verifier themes unless requested.
+- comprehension_gates: exactly 3 short strings named Explain, Verify, Ship.
+- ckb_fiber_hooks: 1-2 short strings.
+- workbench_files: exactly 2 objects with path,language,content.
+- TypeScript only. Each content <=12 lines, escaped newlines inside JSON strings.
+- Include one denial/failure test that returns false, rejects, or throws.
+- Include relevant CKB/Fiber terms: cell, witness, script, xUDT, Fiber invoice, HTLC, channel state, proof, or payout split.
+- Include a unique const or fixture using the variation seed."#
     )
 }
 
+#[cfg(test)]
 fn quest_json_schema() -> Value {
     serde_json::json!({
         "type": "json_schema",
@@ -2058,6 +2128,35 @@ mod tests {
         let parsed = parse_openai_quest_response(response).unwrap();
 
         assert_eq!(parsed.boss_fight, "Patch the replayable receipt.");
+    }
+
+    #[test]
+    fn parses_openai_json_when_provider_wraps_text() {
+        let quest = sample_quest();
+        let wrapped = format!(
+            "Here is the quest JSON:
+{}
+Done.",
+            serde_json::to_string(&quest).unwrap()
+        );
+        let response = OpenAiResponse {
+            output_text: Some(wrapped),
+            output: None,
+        };
+
+        let parsed = parse_openai_quest_response(response).unwrap();
+
+        assert_eq!(parsed.title, "Receipt Raid");
+    }
+
+    #[test]
+    fn compacts_ai_files_with_missing_language() {
+        let mut quest = sample_quest();
+        quest.workbench_files[0].language.clear();
+
+        let compacted = compact_quest_blueprint(quest).unwrap();
+
+        assert_eq!(compacted.workbench_files[0].language, "typescript");
     }
 
     #[test]
