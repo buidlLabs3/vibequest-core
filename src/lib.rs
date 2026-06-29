@@ -253,6 +253,10 @@ struct OpenAiContentItem {
 enum ApiError {
     #[error("build_prompt must be at least 12 characters")]
     InvalidPrompt,
+    #[error(
+        "This looks like a learning request, not a coding quest. Open Learning Mode to generate a lesson path, tutor chat, checkpoints, and follow-up quests."
+    )]
+    LearningRequestNeedsModule,
     #[error("wallet address is required")]
     MissingWalletAddress,
     #[error("wallet signature is required")]
@@ -1490,8 +1494,13 @@ async fn generate_quest(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GenerateQuestRequest>,
 ) -> Result<Json<GenerateQuestResponse>, ApiError> {
-    if request.build_prompt.trim().chars().count() < 12 {
+    let trimmed_prompt = request.build_prompt.trim();
+    if trimmed_prompt.chars().count() < 12 {
         return Err(ApiError::InvalidPrompt);
+    }
+
+    if is_learning_only_prompt(trimmed_prompt) {
+        return Err(ApiError::LearningRequestNeedsModule);
     }
 
     validate_wallet_proof(&request.wallet)?;
@@ -1948,6 +1957,47 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
+fn is_learning_only_prompt(prompt: &str) -> bool {
+    let normalized = prompt.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let learning_openers = [
+        "teach",
+        "explain",
+        "learn",
+        "what is",
+        "what are",
+        "how does",
+        "help me understand",
+        "i want to learn",
+        "tell me about",
+    ];
+    let build_terms = [
+        "build",
+        "create",
+        "implement",
+        "code",
+        "write",
+        "test",
+        "verifier",
+        "function",
+        "app",
+        "contract",
+        "script",
+        "patch",
+        "debug",
+        "ship",
+        "generate a quest",
+    ];
+
+    learning_openers
+        .iter()
+        .any(|opener| normalized.starts_with(opener))
+        && !build_terms.iter().any(|term| normalized.contains(term))
+}
+
 fn quest_prompt(build_prompt: &str, track: &str, difficulty: &Difficulty) -> String {
     let nonce = Uuid::new_v4();
     format!(
@@ -2065,6 +2115,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self {
             ApiError::InvalidPrompt
+            | ApiError::LearningRequestNeedsModule
             | ApiError::MissingWalletAddress
             | ApiError::MissingWalletSignature
             | ApiError::InvalidWalletProofMessage
@@ -2337,6 +2388,20 @@ Done.",
             missing_integrations(&state, &integrations),
             vec!["CKB_RPC_URL", "FIBER_RPC_URL", "MONGODB_URI"]
         );
+    }
+
+    #[test]
+    fn learning_only_prompt_is_not_compiled_as_code_quest() {
+        assert!(is_learning_only_prompt("Teach me about CKB"));
+        assert!(is_learning_only_prompt(
+            "help me understand Fiber payment channels"
+        ));
+        assert!(!is_learning_only_prompt(
+            "Build a CKB lesson quest with a verifier and denial test"
+        ));
+        assert!(!is_learning_only_prompt(
+            "Explain the generated verifier and write a denial test"
+        ));
     }
 
     #[test]
