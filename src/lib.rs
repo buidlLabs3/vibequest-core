@@ -2410,25 +2410,33 @@ async fn list_user_quests(
         return Err(ApiError::MissingWalletAddress);
     }
 
+    if let Err(message) = state.store.availability_diagnostic().await {
+        return Ok(Json(degraded_user_history(message)));
+    }
+
     match state.store.user_history(address).await {
         Ok(history) => Ok(Json(history)),
-        Err(ApiError::Database(_) | ApiError::DatabaseUnavailable) => Ok(Json(
-            UserQuestHistoryResponse {
-                user: None,
-                stats: UserQuestCounts::default(),
-                active_run: None,
-                runs: Vec::new(),
-                reward_claims: Vec::new(),
-                persistence: HistoryPersistenceStatus {
-                    available: false,
-                    message: Some(
-                        "Quest history is syncing. Continue learning in this session; stored history will reconnect once MongoDB is reachable."
-                            .to_string(),
-                    ),
-                },
-            },
-        )),
+        Err(ApiError::Database(message)) => Ok(Json(degraded_user_history(message))),
+        Err(ApiError::DatabaseUnavailable) => Ok(Json(degraded_user_history(
+            "MONGODB_URI is not configured".to_string(),
+        ))),
         Err(error) => Err(error),
+    }
+}
+
+fn degraded_user_history(message: String) -> UserQuestHistoryResponse {
+    UserQuestHistoryResponse {
+        user: None,
+        stats: UserQuestCounts::default(),
+        active_run: None,
+        runs: Vec::new(),
+        reward_claims: Vec::new(),
+        persistence: HistoryPersistenceStatus {
+            available: false,
+            message: Some(format!(
+                "Quest history is syncing. Continue learning in this session; stored history will reconnect once MongoDB is reachable. Detail: {message}"
+            )),
+        },
     }
 }
 
