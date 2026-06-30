@@ -33,7 +33,7 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
 const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Minimal;
 const DEFAULT_OPENAI_TIMEOUT_SECONDS: u64 = 52;
 const QUICK_QUEST_OUTPUT_TOKENS: u16 = 760;
-const LEARNING_MODULE_OUTPUT_TOKENS: u16 = 1050;
+const LEARNING_MODULE_OUTPUT_TOKENS: u16 = 720;
 const TUTOR_OUTPUT_TOKENS: u16 = 520;
 
 #[derive(Clone)]
@@ -169,6 +169,7 @@ struct GenerateLearningModuleResponse {
     module_id: Uuid,
     source: QuestSource,
     module: LearningModule,
+    warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -404,6 +405,7 @@ struct PersistenceStatus {
 #[serde(rename_all = "kebab-case")]
 enum QuestSource {
     OpenAi,
+    CoreFallback,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2286,12 +2288,28 @@ async fn generate_learning_module(
         return Err(ApiError::InvalidPrompt);
     }
 
-    let module = state.openai.generate_learning_module(&request).await?;
+    let (module, source, warning) = match state.openai.generate_learning_module(&request).await {
+        Ok(module) => (module, QuestSource::OpenAi, None),
+        Err(
+            error @ (ApiError::OpenAiTransport(_)
+            | ApiError::OpenAiStatus { .. }
+            | ApiError::InvalidAiResponse),
+        ) => {
+            warn!(%error, "learning module AI generation degraded; using core fallback");
+            (
+                fallback_learning_module(&request),
+                QuestSource::CoreFallback,
+                Some("The live AI lesson generator was slow, so VibeQuest loaded a structured CKB/Fiber learning path. You can start learning now and regenerate later for a fresh AI version.".to_string()),
+            )
+        }
+        Err(error) => return Err(error),
+    };
 
     Ok(Json(GenerateLearningModuleResponse {
         module_id: Uuid::new_v4(),
-        source: QuestSource::OpenAi,
+        source,
         module,
+        warning,
     }))
 }
 
@@ -3299,6 +3317,98 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
+fn fallback_learning_module(request: &GenerateLearningModuleRequest) -> LearningModule {
+    let interests = request
+        .interests
+        .iter()
+        .map(|interest| interest.trim())
+        .filter(|interest| !interest.is_empty())
+        .take(3)
+        .collect::<Vec<_>>();
+    let focus = if interests.is_empty() {
+        "CKB/Fiber fundamentals".to_string()
+    } else {
+        interests.join(" + ")
+    };
+    let background = if request.background.trim().is_empty() {
+        "builder".to_string()
+    } else {
+        request.background.trim().to_string()
+    };
+
+    LearningModule {
+        title: format!("{} Learning Path", clamp_text(focus.clone(), 48)),
+        learner_profile: format!(
+            "A {background} learning {focus} through proof-first explanations, checkpoint questions, and practical quest handoffs."
+        ),
+        outcome: "Explain the CKB/Fiber trust boundary, identify replay or mismatch risks, and turn a completed lesson into a practical verifier quest.".to_string(),
+        lessons: vec![
+            LearningLesson {
+                id: "lesson-1".to_string(),
+                title: "Cells, Scripts, And Witnesses".to_string(),
+                why_it_matters: "Vibecoded CKB apps fail when learners cannot say which state is on-chain, which data is witness-provided, and which checks are local convenience only.".to_string(),
+                explanation: "CKB stores state in cells. A script controls whether a cell can be spent, and witnesses provide transaction-time evidence such as signatures or proof data. When AI generates a verifier, do not just ask if it compiles. Ask what cell it trusts, what script condition it assumes, and what witness field can be copied or changed by an attacker. The practical habit is to trace every accepting branch back to a cell, script, or witness condition and then create one denial case that mutates that condition.".to_string(),
+                concepts: vec!["cell state".to_string(), "lock/type scripts".to_string(), "witness evidence".to_string(), "trust boundary".to_string()],
+                checkpoint: LearningCheckpoint {
+                    question: "A generated verifier accepts a request because `witness.includes(cellId)`. What must you check before trusting it?".to_string(),
+                    options: vec![
+                        LearningOption { label: "Whether the witness is bound to the exact transaction/cell/script state being authorized.".to_string(), feedback: "Correct. A witness string alone is not proof unless it is scoped to the state transition you intend to accept.".to_string() },
+                        LearningOption { label: "Only whether the frontend wallet is connected.".to_string(), feedback: "Wallet connection helps identity, but it does not prove the generated business logic is safe.".to_string() },
+                        LearningOption { label: "Whether the generated code uses TypeScript types.".to_string(), feedback: "Types help shape data, but they do not prove the witness is authentic or non-replayable.".to_string() },
+                        LearningOption { label: "Whether the UI labels the request as paid.".to_string(), feedback: "UI state is not a trust boundary. The verifier must bind evidence to CKB/Fiber state.".to_string() },
+                    ],
+                    correct_index: 0,
+                    explanation: "The trusted claim must be bound to concrete cell/script/witness state, not only to a string that looks right.".to_string(),
+                    follow_up_question: "What denial test would you write if an attacker copied the witness from another cell?".to_string(),
+                },
+                quest_bridge: "Generate a quest that validates a witness against one expected CKB cell and includes a denial test for a mutated cell id.".to_string(),
+            },
+            LearningLesson {
+                id: "lesson-2".to_string(),
+                title: "Fiber Receipts And Replay Risk".to_string(),
+                why_it_matters: "Fiber-style payments are fast, but learners must still prove an invoice, preimage, or channel state cannot be reused across another user, run, or content item.".to_string(),
+                explanation: "A Fiber receipt is useful only when the verifier binds it to the thing being unlocked. The common vibecoding mistake is to check that a preimage exists or an invoice string starts with `fiber:` and forget to bind it to reader, content, amount, route, channel state, and current run. Your review loop is simple: name every field the verifier trusts, mutate one field in a denial test, and confirm access fails. If changing the reader, content id, run id, or channel state still passes, the generated code is reward-unsafe.".to_string(),
+                concepts: vec!["invoice binding".to_string(), "HTLC preimage".to_string(), "channel state".to_string(), "replay defense".to_string()],
+                checkpoint: LearningCheckpoint {
+                    question: "Which receipt check best blocks a paid-content replay attack?".to_string(),
+                    options: vec![
+                        LearningOption { label: "Accept any receipt with a non-empty preimage.".to_string(), feedback: "A copied preimage can unlock the wrong content if it is not scoped.".to_string() },
+                        LearningOption { label: "Bind receipt proof to reader, content id, amount, channel state, and current run.".to_string(), feedback: "Correct. Replay resistance comes from binding proof to the exact access being requested.".to_string() },
+                        LearningOption { label: "Hide the content behind a frontend route.".to_string(), feedback: "Frontend routes can be bypassed; the backend/verifier must enforce the proof.".to_string() },
+                        LearningOption { label: "Check only that CKB RPC is configured.".to_string(), feedback: "Infrastructure readiness does not validate a specific payment receipt.".to_string() },
+                    ],
+                    correct_index: 1,
+                    explanation: "The receipt must be scoped to the user/action/state, otherwise a valid payment artifact can be reused.".to_string(),
+                    follow_up_question: "Which single field would you mutate first to prove the replay test is meaningful?".to_string(),
+                },
+                quest_bridge: "Generate a Fiber receipt verifier quest with tests for missing receipt, wrong reader, wrong content id, and replayed run id.".to_string(),
+            },
+            LearningLesson {
+                id: "lesson-3".to_string(),
+                title: "From Lesson To Quest".to_string(),
+                why_it_matters: "The product goal is not reading docs forever. The learner should prove understanding by turning a concept into a small generated code artifact, tests, and an explanation.".to_string(),
+                explanation: "A strong VibeQuest lesson ends with a quest prompt that is narrow enough to test and rich enough to teach. Start with one invariant: for example, `paid access requires a Fiber proof bound to a CKB cell and reader`. Then ask AI to generate a verifier plus tests. Your job is to inspect the accepting branch, run the generated checks, answer the boss question, and patch or reject weak assumptions. This turns vibecoding from black-box output into a learning loop: ask, inspect, test, explain, ship.".to_string(),
+                concepts: vec!["invariant".to_string(), "denial test".to_string(), "boss explanation".to_string(), "quest handoff".to_string()],
+                checkpoint: LearningCheckpoint {
+                    question: "When should VibeQuest let a learner generate a quest from this lesson?".to_string(),
+                    options: vec![
+                        LearningOption { label: "Immediately, even if the learner skipped the checkpoint.".to_string(), feedback: "That recreates black-box vibecoding. The checkpoint proves readiness.".to_string() },
+                        LearningOption { label: "Only after they memorize every CKB term.".to_string(), feedback: "Memorization is less useful than proving the core invariant and failure path.".to_string() },
+                        LearningOption { label: "After they answer the checkpoint and can name the invariant the quest should test.".to_string(), feedback: "Correct. The quest should be generated from demonstrated understanding.".to_string() },
+                        LearningOption { label: "Only after reward payout is configured.".to_string(), feedback: "Rewards are separate; learning and verification can happen before payout execution.".to_string() },
+                    ],
+                    correct_index: 2,
+                    explanation: "The lesson-to-quest handoff should depend on understanding, not just button clicks.".to_string(),
+                    follow_up_question: "State one invariant your generated quest should enforce.".to_string(),
+                },
+                quest_bridge: "Generate a practical quest from the active lesson invariant and require one denial test before the boss answer unlocks.".to_string(),
+            },
+        ],
+        capstone_quest_prompt: "Build a CKB/Fiber paid-access verifier that binds JoyID identity, a CKB cell proof, Fiber receipt state, and denial tests for replayed or mismatched proof data.".to_string(),
+        resources: default_learning_resources(),
+    }
+}
+
 fn learning_module_prompt(request: &GenerateLearningModuleRequest) -> String {
     let nonce = Uuid::new_v4();
     let interests = request
@@ -3328,14 +3438,14 @@ Variation seed: {nonce}
 Keys exactly: title,learner_profile,outcome,lessons,capstone_quest_prompt,resources.
 Rules:
 - This is a learning module, not a coding quest. Teach deeply before asking them to build.
-- lessons: 3-5 objects with keys id,title,why_it_matters,explanation,concepts,checkpoint,quest_bridge.
+- lessons: exactly 3 objects with keys id,title,why_it_matters,explanation,concepts,checkpoint,quest_bridge.
 - Each lesson must explain a CKB/Fiber/JoyID concept in practical language and connect it to a real builder, auditor, researcher, or community scenario.
 - Each checkpoint has keys question,options,correct_index,explanation,follow_up_question.
 - options: exactly 4 objects with label and feedback. Wrong options must be plausible misunderstandings and feedback must explain why.
 - correct_index must vary across lessons; do not make every answer A.
 - capstone_quest_prompt must be a specific code quest prompt based on the lessons completed.
 - resources: 3-4 authoritative links. Prefer https://docs.nervos.org/, https://github.com/nervosnetwork/fiber, https://docs.joy.id/, and relevant Nervos standards docs.
-- Keep lesson explanations compact but substantive: trust assumptions, common vibecoding mistake, and a concrete check the learner can perform."#,
+- Keep each explanation under 150 words but substantive: trust assumptions, common vibecoding mistake, and a concrete check the learner can perform."#,
         goal = request.learner_goal.trim(),
         background = request.background.trim(),
         pace = request.pace.trim(),
