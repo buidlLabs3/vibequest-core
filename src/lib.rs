@@ -733,6 +733,13 @@ struct UserQuestHistoryResponse {
     active_run: Option<QuestRunRecord>,
     runs: Vec<QuestRunRecord>,
     reward_claims: Vec<RewardClaimRecord>,
+    persistence: HistoryPersistenceStatus,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct HistoryPersistenceStatus {
+    available: bool,
+    message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1017,6 +1024,10 @@ impl MongoStore {
             active_run,
             runs: records,
             reward_claims,
+            persistence: HistoryPersistenceStatus {
+                available: true,
+                message: None,
+            },
         })
     }
 
@@ -2394,7 +2405,31 @@ async fn list_user_quests(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
 ) -> Result<Json<UserQuestHistoryResponse>, ApiError> {
-    Ok(Json(state.store.user_history(&address).await?))
+    let address = address.trim();
+    if address.is_empty() {
+        return Err(ApiError::MissingWalletAddress);
+    }
+
+    match state.store.user_history(address).await {
+        Ok(history) => Ok(Json(history)),
+        Err(ApiError::Database(_) | ApiError::DatabaseUnavailable) => Ok(Json(
+            UserQuestHistoryResponse {
+                user: None,
+                stats: UserQuestCounts::default(),
+                active_run: None,
+                runs: Vec::new(),
+                reward_claims: Vec::new(),
+                persistence: HistoryPersistenceStatus {
+                    available: false,
+                    message: Some(
+                        "Quest history is syncing. Continue learning in this session; stored history will reconnect once MongoDB is reachable."
+                            .to_string(),
+                    ),
+                },
+            },
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 async fn get_quest_run(
