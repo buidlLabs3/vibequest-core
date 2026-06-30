@@ -13,6 +13,7 @@ use futures_util::TryStreamExt;
 use mongodb::{
     Client as MongoClient, Collection, Database,
     bson::{DateTime as BsonDateTime, Document, doc},
+    options::ClientOptions,
 };
 use reqwest::{Client, StatusCode as ReqwestStatusCode};
 use serde::{Deserialize, Serialize};
@@ -863,8 +864,13 @@ impl MongoStore {
         let client = self
             .client
             .get_or_try_init(move || async move {
-                MongoClient::with_uri_str(&uri)
+                let mut options = ClientOptions::parse(&uri)
                     .await
+                    .map_err(|error| ApiError::Database(error.to_string()))?;
+                options.server_selection_timeout = Some(Duration::from_secs(3));
+                options.connect_timeout = Some(Duration::from_secs(3));
+
+                MongoClient::with_options(options)
                     .map_err(|error| ApiError::Database(error.to_string()))
             })
             .await?;
