@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -29,7 +31,7 @@ const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
 const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Minimal;
 const DEFAULT_OPENAI_TIMEOUT_SECONDS: u64 = 52;
-const QUICK_QUEST_OUTPUT_TOKENS: u16 = 520;
+const QUICK_QUEST_OUTPUT_TOKENS: u16 = 760;
 const LEARNING_MODULE_OUTPUT_TOKENS: u16 = 1050;
 const TUTOR_OUTPUT_TOKENS: u16 = 520;
 
@@ -391,12 +393,34 @@ struct QuestBlueprint {
     comprehension_gates: Vec<String>,
     #[serde(alias = "bossFight")]
     boss_fight: String,
+    #[serde(alias = "challengeBrief", default)]
+    challenge_brief: Option<QuestChallengeBrief>,
     #[serde(alias = "rewardLogic")]
     reward_logic: String,
     #[serde(alias = "ckbFiberHooks", default)]
     ckb_fiber_hooks: Vec<String>,
     #[serde(alias = "workbenchFiles")]
     workbench_files: Vec<WorkbenchFile>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct QuestChallengeBrief {
+    question: String,
+    correct_answer: String,
+    wrong_answers: Vec<ChallengeWrongAnswer>,
+    invariant: String,
+    attack_scenario: String,
+    code_focus: String,
+    test_focus: String,
+    hint: String,
+    follow_up_question: String,
+    resources: Vec<LearningResource>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ChallengeWrongAnswer {
+    label: String,
+    feedback: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -525,6 +549,8 @@ struct QuestRunDocument {
     quest: QuestBlueprint,
     ship_requirements: ShipRequirements,
     progress: QuestProgress,
+    #[serde(default)]
+    boss_attempts: Vec<BossAttempt>,
     status: QuestRunStatus,
     created_at: BsonDateTime,
     updated_at: BsonDateTime,
@@ -691,6 +717,7 @@ struct QuestRunRecord {
     quest: QuestBlueprint,
     ship_requirements: ShipRequirements,
     progress: QuestProgress,
+    boss_attempts: Vec<BossAttempt>,
     status: QuestRunStatus,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -703,7 +730,27 @@ struct UpdateQuestProgressRequest {
     wallet: WalletProof,
     gates: Option<Vec<StoredGateProgress>>,
     boss_fight_solved: Option<bool>,
+    boss_attempt: Option<BossAttemptRequest>,
     shipped: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct BossAttempt {
+    selected_index: i64,
+    selected_label: String,
+    correct: bool,
+    feedback: String,
+    follow_up_question: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BossAttemptRequest {
+    selected_index: i64,
+    selected_label: String,
+    correct: bool,
+    feedback: String,
+    follow_up_question: String,
 }
 
 impl MongoStore {
@@ -813,6 +860,7 @@ impl MongoStore {
                 response.ship_requirements.ckb_rpc_ready
                     && response.ship_requirements.fiber_rpc_ready,
             ),
+            boss_attempts: Vec::new(),
             status: QuestRunStatus::InProgress,
             created_at: now,
             updated_at: now,
@@ -1060,6 +1108,13 @@ impl MongoStore {
         if let Some(boss_fight_solved) = request.boss_fight_solved {
             run.progress.boss_fight_solved = boss_fight_solved;
         }
+        if let Some(attempt) = request.boss_attempt {
+            run.boss_attempts.push(compact_boss_attempt(attempt));
+            if run.boss_attempts.len() > 20 {
+                let drain_count = run.boss_attempts.len() - 20;
+                run.boss_attempts.drain(0..drain_count);
+            }
+        }
         if let Some(shipped) = request.shipped {
             if shipped {
                 return Err(ApiError::CompletionNotVerified);
@@ -1255,6 +1310,7 @@ impl From<QuestRunDocument> for QuestRunRecord {
             quest: run.quest,
             ship_requirements: run.ship_requirements,
             progress: run.progress,
+            boss_attempts: run.boss_attempts,
             status: run.status,
             created_at: bson_datetime_to_utc(run.created_at),
             updated_at: bson_datetime_to_utc(run.updated_at),
@@ -2399,7 +2455,109 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
         return Err(ApiError::InvalidAiResponse);
     }
 
+    quest.challenge_brief = Some(compact_challenge_brief(quest.challenge_brief.take()));
+
     Ok(quest)
+}
+
+fn compact_challenge_brief(brief: Option<QuestChallengeBrief>) -> QuestChallengeBrief {
+    let mut brief = brief.unwrap_or_default();
+    brief.question = non_empty_or(
+        clamp_text(brief.question, 260),
+        "Which exact invariant makes this generated CKB/Fiber code safe to ship?",
+    );
+    brief.correct_answer = non_empty_or(
+        clamp_text(brief.correct_answer, 260),
+        "Defend the generated verifier by proving the trusted CKB/Fiber fields are bound to the action and covered by a denial test.",
+    );
+    brief.invariant = non_empty_or(
+        clamp_text(brief.invariant, 260),
+        "The accepted proof must bind the actor, action, CKB state, and Fiber payment state.",
+    );
+    brief.attack_scenario = non_empty_or(
+        clamp_text(brief.attack_scenario, 260),
+        "An attacker copies a valid-looking proof into a different run, cell, user, or payout context.",
+    );
+    brief.code_focus = non_empty_or(
+        clamp_text(brief.code_focus, 160),
+        "Inspect the accepting verifier branch.",
+    );
+    brief.test_focus = non_empty_or(
+        clamp_text(brief.test_focus, 180),
+        "Find the denial test that mutates the trusted field.",
+    );
+    brief.hint = non_empty_or(
+        clamp_text(brief.hint, 260),
+        "Trace the field the implementation trusts, then confirm the test mutates that same field.",
+    );
+    brief.follow_up_question = non_empty_or(
+        clamp_text(brief.follow_up_question, 260),
+        "What field would you mutate first to prove this generated code rejects replay or unpaid access?",
+    );
+    brief.wrong_answers = compact_wrong_answers(brief.wrong_answers);
+    brief.resources = compact_learning_resources(brief.resources);
+    brief
+}
+
+fn compact_wrong_answers(values: Vec<ChallengeWrongAnswer>) -> Vec<ChallengeWrongAnswer> {
+    let mut answers = values
+        .into_iter()
+        .filter(|answer| !answer.label.trim().is_empty())
+        .map(|answer| ChallengeWrongAnswer {
+            label: clamp_text(answer.label, 180),
+            feedback: non_empty_or(
+                clamp_text(answer.feedback, 260),
+                "This skips the generated code's trust boundary. Point to the verifier and denial test instead.",
+            ),
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+
+    let defaults = [
+        (
+            "Accept the generated code because the happy-path test passes.",
+            "Happy-path tests do not prove the CKB/Fiber trust boundary; mutate the trusted field and watch the verifier reject it.",
+        ),
+        (
+            "Check only the connected wallet and ignore the generated verifier.",
+            "Wallet binding matters, but the quest is asking whether the generated proof, witness, invoice, or payout logic is safe.",
+        ),
+        (
+            "Ship once the UI displays a reward claim.",
+            "Reward display is not evidence. VibeQuest needs an explained invariant plus a denial-path test.",
+        ),
+    ];
+
+    for (label, feedback) in defaults {
+        if answers.len() >= 3 {
+            break;
+        }
+        answers.push(ChallengeWrongAnswer {
+            label: label.to_string(),
+            feedback: feedback.to_string(),
+        });
+    }
+
+    answers
+}
+
+fn compact_boss_attempt(attempt: BossAttemptRequest) -> BossAttempt {
+    BossAttempt {
+        selected_index: attempt.selected_index.clamp(0, 12),
+        selected_label: clamp_text(attempt.selected_label, 220),
+        correct: attempt.correct,
+        feedback: clamp_text(attempt.feedback, 360),
+        follow_up_question: clamp_text(attempt.follow_up_question, 260),
+        created_at: Utc::now(),
+    }
+}
+
+fn non_empty_or(value: String, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        value
+    }
 }
 
 fn compact_learning_quest_link(link: LearningQuestLink) -> LearningQuestLink {
@@ -2844,7 +3002,7 @@ Difficulty: {difficulty:?}
 {learning_context}
 Variation seed: {nonce}
 
-Keys exactly: title,premise,build_objective,comprehension_gates,boss_fight,reward_logic,ckb_fiber_hooks,workbench_files.
+Keys exactly: title,premise,build_objective,comprehension_gates,boss_fight,challenge_brief,reward_logic,ckb_fiber_hooks,workbench_files.
 Rules:
 - Specific to Request and Learning source; if a lesson source is present, build the quest from that lesson instead of a generic prompt.
 - Specific to Request; do not reuse paywall/verifier themes unless requested.
@@ -2854,6 +3012,8 @@ Rules:
 - TypeScript only. Each content <=12 lines, escaped newlines inside JSON strings.
 - Include one denial/failure test that mutates the exact trusted field from the implementation.
 - Make boss_fight reference the generated function, invariant, and attack/failure case, not a generic reward checklist.
+- challenge_brief must be code-specific: question, correct_answer, exactly 3 wrong_answers with feedback, invariant, attack_scenario, code_focus, test_focus, hint, follow_up_question, and 2 resources.
+- correct_answer and wrong_answers must not be generic reward or UI statements; each must mention the generated code's actual invariant, trusted fields, attack, or test.
 - Include relevant CKB/Fiber terms: cell, witness, script, xUDT, Fiber invoice, HTLC, channel state, proof, or payout split.
 - Include a unique const or fixture using the variation seed."#
     )
@@ -2874,6 +3034,7 @@ fn quest_json_schema() -> Value {
                 "build_objective",
                 "comprehension_gates",
                 "boss_fight",
+                "challenge_brief",
                 "reward_logic",
                 "ckb_fiber_hooks",
                 "workbench_files"
@@ -2903,6 +3064,50 @@ fn quest_json_schema() -> Value {
                 "boss_fight": {
                     "type": "string",
                     "description": "The final challenge before the learner can ship."
+                },
+                "challenge_brief": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["question", "correct_answer", "wrong_answers", "invariant", "attack_scenario", "code_focus", "test_focus", "hint", "follow_up_question", "resources"],
+                    "properties": {
+                        "question": { "type": "string" },
+                        "correct_answer": { "type": "string" },
+                        "wrong_answers": {
+                            "type": "array",
+                            "minItems": 3,
+                            "maxItems": 3,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["label", "feedback"],
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "feedback": { "type": "string" }
+                                }
+                            }
+                        },
+                        "invariant": { "type": "string" },
+                        "attack_scenario": { "type": "string" },
+                        "code_focus": { "type": "string" },
+                        "test_focus": { "type": "string" },
+                        "hint": { "type": "string" },
+                        "follow_up_question": { "type": "string" },
+                        "resources": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["title", "url", "reason"],
+                                "properties": {
+                                    "title": { "type": "string" },
+                                    "url": { "type": "string" },
+                                    "reason": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
                 },
                 "reward_logic": {
                     "type": "string",
@@ -3150,6 +3355,7 @@ Done.",
             .unwrap();
 
         assert!(required.contains(&Value::String("boss_fight".to_string())));
+        assert!(required.contains(&Value::String("challenge_brief".to_string())));
         assert!(required.contains(&Value::String("ckb_fiber_hooks".to_string())));
         assert!(required.contains(&Value::String("workbench_files".to_string())));
     }
@@ -3385,6 +3591,7 @@ Done.",
                 "Ship only after the badge and payout claim are defended.".to_string(),
             ],
             boss_fight: "A reader replays a receipt from another run. Identify the missing run binding.".to_string(),
+            challenge_brief: Some(sample_challenge_brief()),
             reward_logic: "CKB stores the proof badge and Fiber invoice-bound reward claim.".to_string(),
             ckb_fiber_hooks: vec![
                 "CKB proof hash binds the quest receipt.".to_string(),
@@ -3448,6 +3655,7 @@ Done.",
                 boss_fight_solved: true,
                 shipped: false,
             },
+            boss_attempts: Vec::new(),
             status: QuestRunStatus::InProgress,
             created_at: now,
             updated_at: now,
@@ -3457,6 +3665,34 @@ Done.",
                 currency: "Fibd".to_string(),
                 sponsor: "vibequest-core".to_string(),
             },
+        }
+    }
+
+    fn sample_challenge_brief() -> QuestChallengeBrief {
+        QuestChallengeBrief {
+            question: "Which proof makes the generated receipt verifier safe to ship?".to_string(),
+            correct_answer: "Bind the Fiber invoice, CKB proof hash, reader, and run before allowing the paid read.".to_string(),
+            wrong_answers: vec![
+                ChallengeWrongAnswer {
+                    label: "Trust the happy path fixture.".to_string(),
+                    feedback: "The happy path does not attack replay.".to_string(),
+                },
+                ChallengeWrongAnswer {
+                    label: "Only check that a wallet is connected.".to_string(),
+                    feedback: "Wallet connection does not prove the receipt belongs to this read.".to_string(),
+                },
+                ChallengeWrongAnswer {
+                    label: "Ship when the reward amount exists.".to_string(),
+                    feedback: "Reward metadata is not code safety evidence.".to_string(),
+                },
+            ],
+            invariant: "The receipt must bind run, reader, content, Fiber preimage, and CKB proof hash.".to_string(),
+            attack_scenario: "A user replays another run's receipt against the active paid-content read.".to_string(),
+            code_focus: "Inspect canReadPaidContent and every equality check.".to_string(),
+            test_focus: "Mutate runId or reader in the denial test.".to_string(),
+            hint: "Start with the field an attacker can copy, then prove the verifier rejects it.".to_string(),
+            follow_up_question: "Which trusted receipt field would you mutate first to prove replay is blocked?".to_string(),
+            resources: default_learning_resources().into_iter().take(2).collect(),
         }
     }
 
@@ -3471,6 +3707,7 @@ Done.",
                 "Ship with badge proof.".to_string(),
             ],
             boss_fight: "Patch the replayable receipt.".to_string(),
+            challenge_brief: Some(sample_challenge_brief()),
             reward_logic: "XP per gate, reward after boss.".to_string(),
             ckb_fiber_hooks: vec![
                 "CKB proof badge.".to_string(),
