@@ -2650,6 +2650,9 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
     if quest.workbench_files.len() > 2 {
         quest.workbench_files.truncate(2);
     }
+    if quest.workbench_files.len() < 2 {
+        return Err(ApiError::InvalidAiResponse);
+    }
 
     for file in &mut quest.workbench_files {
         if file.language.trim().is_empty() {
@@ -2668,8 +2671,109 @@ fn compact_quest_blueprint(mut quest: QuestBlueprint) -> Result<QuestBlueprint, 
     }
 
     quest.challenge_brief = Some(compact_challenge_brief(quest.challenge_brief.take()));
+    validate_quest_quality(&quest)?;
 
     Ok(quest)
+}
+
+fn validate_quest_quality(quest: &QuestBlueprint) -> Result<(), ApiError> {
+    let workspace = quest
+        .workbench_files
+        .iter()
+        .map(|file| format!("{}\n{}", file.path, file.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    let prose = format!(
+        "{} {} {} {} {}",
+        quest.title,
+        quest.premise,
+        quest.build_objective,
+        quest.boss_fight,
+        quest.ckb_fiber_hooks.join(" ")
+    )
+    .to_lowercase();
+    let challenge = quest
+        .challenge_brief
+        .as_ref()
+        .ok_or(ApiError::InvalidAiResponse)?;
+    let challenge_text = format!(
+        "{} {} {} {} {} {} {}",
+        challenge.question,
+        challenge.correct_answer,
+        challenge.invariant,
+        challenge.attack_scenario,
+        challenge.code_focus,
+        challenge.test_focus,
+        challenge.hint,
+    )
+    .to_lowercase();
+
+    let has_implementation = quest.workbench_files.iter().any(|file| {
+        let path = file.path.to_lowercase();
+        !path.contains("test") && !path.contains("spec")
+    });
+    let has_test = quest.workbench_files.iter().any(|file| {
+        let haystack = format!("{}\n{}", file.path, file.content).to_lowercase();
+        haystack.contains("test")
+            || haystack.contains("assert")
+            || haystack.contains("expect")
+            || haystack.contains("throws")
+    });
+    let has_domain_signal = [
+        "ckb", "cell", "witness", "script", "xudt", "fiber", "invoice", "htlc", "channel", "proof",
+        "receipt", "payout",
+    ]
+    .iter()
+    .any(|term| workspace.contains(term));
+    let has_denial_signal = [
+        "reject",
+        "block",
+        "false",
+        "throw",
+        "invalid",
+        "unpaid",
+        "deny",
+        "mismatch",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|term| workspace.contains(term));
+    let has_specific_challenge = [
+        "cell", "witness", "script", "xudt", "fiber", "invoice", "htlc", "channel", "proof",
+        "receipt", "payout", "reader", "run", "content",
+    ]
+    .iter()
+    .any(|term| workspace.contains(term) && challenge_text.contains(term));
+    let rejects_generic_reward_logic = ![
+        "ui renders",
+        "reward amount exists",
+        "enough files",
+        "looks complete",
+    ]
+    .iter()
+    .any(|phrase| challenge.correct_answer.to_lowercase().contains(phrase));
+    let prompt_relevance = quest
+        .build_objective
+        .split_whitespace()
+        .filter(|word| word.len() >= 5)
+        .take(12)
+        .any(|word| {
+            prose.contains(&word.to_lowercase()) || workspace.contains(&word.to_lowercase())
+        });
+
+    if has_implementation
+        && has_test
+        && has_domain_signal
+        && has_denial_signal
+        && has_specific_challenge
+        && rejects_generic_reward_logic
+        && prompt_relevance
+    {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidAiResponse)
+    }
 }
 
 fn compact_challenge_brief(brief: Option<QuestChallengeBrief>) -> QuestChallengeBrief {
@@ -3554,6 +3658,54 @@ Done.",
     }
 
     #[test]
+    fn quest_quality_rejects_missing_denial_test() {
+        let mut quest = sample_quest();
+        quest.workbench_files[1].content =
+            "test('happy path', () => expect(canRead({ receipt: 'ok' })).toBe(true));".to_string();
+
+        assert!(matches!(
+            compact_quest_blueprint(quest),
+            Err(ApiError::InvalidAiResponse)
+        ));
+    }
+
+    #[test]
+    fn quest_quality_rejects_generic_challenge() {
+        let mut quest = sample_quest();
+        quest.challenge_brief = Some(QuestChallengeBrief {
+            question: "When should rewards unlock?".to_string(),
+            correct_answer: "Ship once the UI renders and a reward amount exists.".to_string(),
+            wrong_answers: vec![],
+            invariant: "Reward amount exists.".to_string(),
+            attack_scenario: "No real code attack.".to_string(),
+            code_focus: "Look at the UI.".to_string(),
+            test_focus: "No test focus.".to_string(),
+            hint: "Check the reward.".to_string(),
+            follow_up_question: "Did the UI render?".to_string(),
+            resources: vec![],
+        });
+
+        assert!(matches!(
+            compact_quest_blueprint(quest),
+            Err(ApiError::InvalidAiResponse)
+        ));
+    }
+
+    #[test]
+    fn quest_quality_rejects_missing_domain_terms() {
+        let mut quest = sample_quest();
+        quest.workbench_files[0].content =
+            "export function allow(input: string) { return input.length > 0; }".to_string();
+        quest.workbench_files[1].content =
+            "test('rejects empty input', () => expect(allow('')).toBe(false));".to_string();
+
+        assert!(matches!(
+            compact_quest_blueprint(quest),
+            Err(ApiError::InvalidAiResponse)
+        ));
+    }
+
+    #[test]
     fn wallet_proof_requires_real_signature_fields() {
         let wallet = joyid_wallet_fixture();
 
@@ -4019,12 +4171,12 @@ Done.",
                 WorkbenchFile {
                     path: "app/api/unlock/route.ts".to_string(),
                     language: "ts".to_string(),
-                    content: "export async function POST() {}".to_string(),
+                    content: "export type Receipt={runId:string;reader:string;contentId:string;fiberInvoice:string;ckbProofHash:string}; export function canReadPaidContent(receipt:Receipt, runId:string, reader:string, contentId:string){ return receipt.runId===runId && receipt.reader===reader && receipt.contentId===contentId && receipt.fiberInvoice.startsWith('fiber:') && receipt.ckbProofHash.startsWith('0x'); }".to_string(),
                 },
                 WorkbenchFile {
                     path: "tests/unlock.test.ts".to_string(),
                     language: "ts".to_string(),
-                    content: "test('blocks unpaid reads', () => {})".to_string(),
+                    content: "test('blocks unpaid reads', () => expect(canReadPaidContent({runId:'old',reader:'alice',contentId:'post',fiberInvoice:'fiber:invoice',ckbProofHash:'0xabc'}, 'run', 'alice', 'post')).toBe(false)); test('rejects mismatched reader receipt', () => expect(canReadPaidContent({runId:'run',reader:'mallory',contentId:'post',fiberInvoice:'fiber:invoice',ckbProofHash:'0xabc'}, 'run', 'alice', 'post')).toBe(false));".to_string(),
                 },
             ],
         }
