@@ -15,9 +15,12 @@ use mongodb::{
     bson::{DateTime as BsonDateTime, Document, doc},
     options::ClientOptions,
 };
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey, signature::Verifier as _};
 use reqwest::{Client, StatusCode as ReqwestStatusCode};
+use ring::signature::{self, RsaPublicKeyComponents};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{env, error::Error, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -364,6 +367,10 @@ struct WalletSignature {
     signature: String,
     identity: String,
     sign_type: String,
+    pubkey: Option<String>,
+    key_type: Option<String>,
+    challenge: Option<String>,
+    alg: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -531,6 +538,8 @@ enum ApiError {
     CompletionNotVerified,
     #[error("Fiber invoice is required before locking a reward claim")]
     MissingFiberInvoice,
+    #[error("Fiber invoice is not valid enough to lock a reward claim")]
+    InvalidFiberInvoice,
     #[error("Fiber payout is not configured on vibequest-core")]
     FiberPayoutUnavailable,
     #[error("Fiber payout failed: {0}")]
@@ -1277,9 +1286,7 @@ impl MongoStore {
         fiber: &FiberPayoutClient,
     ) -> Result<CompleteQuestResponse, ApiError> {
         validate_wallet_proof(&request.wallet)?;
-        if request.fiber_invoice.trim().is_empty() {
-            return Err(ApiError::MissingFiberInvoice);
-        }
+        validate_reward_invoice(&request.fiber_invoice)?;
 
         let mut run = self.get_run(run_id).await?;
         if run.user_address != request.wallet.address.trim() {
@@ -1516,6 +1523,25 @@ fn initial_quest_progress(infrastructure_ready: bool) -> QuestProgress {
         boss_fight_solved: false,
         shipped: false,
     }
+}
+
+fn validate_reward_invoice(invoice: &str) -> Result<(), ApiError> {
+    let trimmed = invoice.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::MissingFiberInvoice);
+    }
+
+    let has_invoice_shape = trimmed.len() >= 12
+        && !trimmed.chars().any(char::is_whitespace)
+        && trimmed
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ":_-./=".contains(character));
+
+    if !has_invoice_shape {
+        return Err(ApiError::InvalidFiberInvoice);
+    }
+
+    Ok(())
 }
 
 fn server_completion_proof(run: &QuestRunDocument) -> Result<ServerCompletionProof, ApiError> {
@@ -2599,6 +2625,10 @@ struct JoyIdSignaturePayload {
     signature: String,
     alg: Value,
     message: String,
+    pubkey: Option<String>,
+    challenge: Option<String>,
+    #[serde(rename = "keyType")]
+    key_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2631,11 +2661,38 @@ fn verify_joyid_wallet_proof(wallet: &WalletProof) -> Result<(), ApiError> {
     let identity_payload = serde_json::from_str::<JoyIdIdentityPayload>(&wallet.signature.identity)
         .map_err(|_| ApiError::InvalidWalletSignature)?;
 
+    let pubkey = wallet
+        .signature
+        .pubkey
+        .as_deref()
+        .or(signature_payload.pubkey.as_deref())
+        .unwrap_or(identity_payload.public_key.as_str())
+        .trim()
+        .trim_start_matches("0x");
+    let key_type = wallet
+        .signature
+        .key_type
+        .as_deref()
+        .or(signature_payload.key_type.as_deref())
+        .unwrap_or(identity_payload.key_type.as_str())
+        .trim();
+    let alg = wallet
+        .signature
+        .alg
+        .as_ref()
+        .unwrap_or(&signature_payload.alg);
+    let challenge = wallet
+        .signature
+        .challenge
+        .as_deref()
+        .or(signature_payload.challenge.as_deref())
+        .unwrap_or(wallet.message.as_str());
+
     if signature_payload.signature.trim().is_empty()
         || signature_payload.message.trim().is_empty()
-        || signature_payload.alg.is_null()
-        || !is_joyid_key_type(&identity_payload.key_type)
-        || !is_hex_public_key(&identity_payload.public_key)
+        || alg.is_null()
+        || !is_joyid_key_type(key_type)
+        || !is_hex_public_key(pubkey)
     {
         return Err(ApiError::InvalidWalletSignature);
     }
@@ -2644,11 +2701,145 @@ fn verify_joyid_wallet_proof(wallet: &WalletProof) -> Result<(), ApiError> {
         return Err(ApiError::InvalidWalletSignature);
     };
 
-    if signed_challenge != wallet.message {
+    if signed_challenge != wallet.message || challenge != wallet.message {
+        return Err(ApiError::InvalidWalletSignature);
+    }
+
+    if !verify_joyid_signature(
+        key_type,
+        alg,
+        pubkey,
+        &signature_payload.message,
+        &signature_payload.signature,
+    ) {
         return Err(ApiError::InvalidWalletSignature);
     }
 
     Ok(())
+}
+
+fn verify_joyid_signature(
+    key_type: &str,
+    alg: &Value,
+    pubkey_hex: &str,
+    message: &str,
+    signature_value: &str,
+) -> bool {
+    let Some(message_bytes) = decode_base64_url(message) else {
+        return false;
+    };
+    let Some(signature_bytes) = decode_base64_url(signature_value) else {
+        return false;
+    };
+    let Some(pubkey_bytes) = decode_hex(pubkey_hex) else {
+        return false;
+    };
+
+    if matches!(key_type.trim(), "main_session_key" | "sub_session_key") {
+        return verify_rs256(&pubkey_bytes, &message_bytes, &signature_bytes);
+    }
+
+    let Some(client_data_start) = find_client_data_start(&message_bytes) else {
+        return false;
+    };
+    if client_data_start < 37 {
+        return false;
+    }
+    let auth_data = &message_bytes[..37];
+    let client_data = &message_bytes[client_data_start..];
+    let client_hash = Sha256::digest(client_data);
+    let mut signature_base = Vec::with_capacity(auth_data.len() + client_hash.len());
+    signature_base.extend_from_slice(auth_data);
+    signature_base.extend_from_slice(&client_hash);
+
+    if joyid_alg_is_rs256(alg) {
+        verify_rs256(&pubkey_bytes, &signature_base, &signature_bytes)
+    } else if joyid_alg_is_es256(alg) {
+        verify_es256(&pubkey_bytes, &signature_base, &signature_bytes)
+    } else {
+        false
+    }
+}
+
+fn verify_es256(pubkey: &[u8], message: &[u8], der_signature: &[u8]) -> bool {
+    let key_bytes = if pubkey.len() == 64 {
+        let mut uncompressed = Vec::with_capacity(65);
+        uncompressed.push(0x04);
+        uncompressed.extend_from_slice(pubkey);
+        uncompressed
+    } else {
+        pubkey.to_vec()
+    };
+
+    let Ok(key) = VerifyingKey::from_sec1_bytes(&key_bytes) else {
+        return false;
+    };
+    let Ok(signature) = P256Signature::from_der(der_signature) else {
+        return false;
+    };
+
+    key.verify(message, &signature).is_ok()
+}
+
+fn verify_rs256(pubkey: &[u8], message: &[u8], signature_bytes: &[u8]) -> bool {
+    if pubkey.len() <= 4 {
+        return false;
+    }
+
+    let exponent = pubkey[..3].iter().rev().copied().collect::<Vec<_>>();
+    let modulus = pubkey[4..].iter().rev().copied().collect::<Vec<_>>();
+    let components = RsaPublicKeyComponents {
+        n: &modulus,
+        e: &exponent,
+    };
+
+    components
+        .verify(
+            &signature::RSA_PKCS1_2048_8192_SHA256,
+            message,
+            signature_bytes,
+        )
+        .is_ok()
+}
+
+fn joyid_alg_is_es256(value: &Value) -> bool {
+    value.as_i64() == Some(-7)
+        || value
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("ES256"))
+}
+
+fn joyid_alg_is_rs256(value: &Value) -> bool {
+    value.as_i64() == Some(-257)
+        || value
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("RS256"))
+}
+
+fn decode_base64_url(value: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value.as_bytes())
+        .ok()
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    let trimmed = value.trim().trim_start_matches("0x");
+    if trimmed.len() % 2 != 0
+        || !trimmed
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+
+    (0..trimmed.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&trimmed[index..index + 2], 16).ok())
+        .collect()
+}
+
+fn find_client_data_start(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|window| window == b"{\"")
 }
 
 fn is_joyid_key_type(value: &str) -> bool {
@@ -2669,13 +2860,8 @@ fn is_hex_public_key(value: &str) -> bool {
 }
 
 fn joyid_signed_challenge(message: &str) -> Option<String> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(message.as_bytes())
-        .ok()?;
-    let client_data_start = bytes
-        .windows(2)
-        .position(|window| window == b"{\"")
-        .unwrap_or(0);
+    let bytes = decode_base64_url(message)?;
+    let client_data_start = find_client_data_start(&bytes).unwrap_or(0);
     let client_data = std::str::from_utf8(&bytes[client_data_start..]).ok()?;
 
     if let Ok(parsed) = serde_json::from_str::<Value>(client_data) {
@@ -3767,7 +3953,8 @@ impl IntoResponse for ApiError {
             | ApiError::InvalidWalletProofMessage
             | ApiError::UnsupportedWalletSignature
             | ApiError::InvalidWalletSignature
-            | ApiError::MissingFiberInvoice => StatusCode::BAD_REQUEST,
+            | ApiError::MissingFiberInvoice
+            | ApiError::InvalidFiberInvoice => StatusCode::BAD_REQUEST,
             ApiError::MissingOpenAiKey
             | ApiError::DatabaseUnavailable
             | ApiError::FiberPayoutUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -3796,6 +3983,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::ecdsa::{SigningKey, signature::Signer as _};
     #[test]
     fn parses_openai_output_text() {
         let quest = sample_quest();
@@ -3916,6 +4104,10 @@ Done.",
                 signature: String::new(),
                 identity: "0xidentity".to_string(),
                 sign_type: "JoyId".to_string(),
+                pubkey: None,
+                key_type: None,
+                challenge: None,
+                alg: None,
             },
             ..wallet
         };
@@ -3982,7 +4174,7 @@ Done.",
     }
 
     #[test]
-    fn wallet_proof_accepts_session_key_payload_message() {
+    fn wallet_proof_rejects_fake_session_key_payload_message() {
         let mut wallet = joyid_wallet_fixture();
         wallet.signature.identity = serde_json::json!({
             "keyType": "main_session_key",
@@ -3995,8 +4187,14 @@ Done.",
             "message": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wallet.message.as_bytes())
         })
         .to_string();
+        wallet.signature.key_type = Some("main_session_key".to_string());
+        wallet.signature.pubkey = Some(format!("02{}", "22".repeat(32)));
+        wallet.signature.alg = Some(serde_json::json!("RS256"));
 
-        validate_wallet_proof(&wallet).unwrap();
+        assert!(matches!(
+            validate_wallet_proof(&wallet),
+            Err(ApiError::InvalidWalletSignature)
+        ));
     }
 
     #[test]
@@ -4168,6 +4366,27 @@ Done.",
     }
 
     #[test]
+    fn reward_invoice_validation_rejects_missing_or_unsafe_values() {
+        assert!(matches!(
+            validate_reward_invoice("   "),
+            Err(ApiError::MissingFiberInvoice)
+        ));
+        assert!(matches!(
+            validate_reward_invoice("fiber invoice with spaces"),
+            Err(ApiError::InvalidFiberInvoice)
+        ));
+        assert!(matches!(
+            validate_reward_invoice("short"),
+            Err(ApiError::InvalidFiberInvoice)
+        ));
+    }
+
+    #[test]
+    fn reward_invoice_validation_accepts_plausible_fiber_invoice() {
+        validate_reward_invoice("fiber:testnet-invoice-abc123").unwrap();
+    }
+
+    #[test]
     fn server_completion_proof_rejects_unverified_runs() {
         let mut run = quest_run_fixture();
         run.progress.boss_fight_solved = false;
@@ -4197,15 +4416,15 @@ Done.",
         let message = format!(
             "VibeQuest wallet proof\nAddress: {address}\nIssued: 2026-06-24T00:00:00.000Z\nPurpose: bind generated quest runs, proof notes, and reward claims to this signer."
         );
+        let signing_key = SigningKey::from_slice(&[7_u8; 32]).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let encoded_point = verifying_key.to_encoded_point(false);
+        let pubkey = hex_encode(&encoded_point.as_bytes()[1..]);
         let identity = serde_json::json!({
             "keyType": "main_key",
-            "publicKey": format!("02{}", "11".repeat(32))
+            "publicKey": pubkey
         });
-        let signature = serde_json::json!({
-            "signature": "joyid-passkey-signature-fixture",
-            "alg": "ES256",
-            "message": joyid_webauthn_message(&message)
-        });
+        let signature = joyid_signed_webauthn_payload(&message, &signing_key);
 
         WalletProof {
             address,
@@ -4214,8 +4433,37 @@ Done.",
                 signature: signature.to_string(),
                 identity: identity.to_string(),
                 sign_type: "JoyId".to_string(),
+                pubkey: None,
+                key_type: None,
+                challenge: None,
+                alg: None,
             },
         }
+    }
+
+    fn joyid_signed_webauthn_payload(challenge: &str, signing_key: &SigningKey) -> Value {
+        let encoded_challenge =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge.as_bytes());
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": encoded_challenge,
+            "origin": "https://testnet.joyid.dev"
+        })
+        .to_string();
+        let mut payload = vec![0_u8; 37];
+        payload.extend(client_data.as_bytes());
+
+        let client_hash = Sha256::digest(client_data.as_bytes());
+        let mut signature_base = Vec::with_capacity(37 + client_hash.len());
+        signature_base.extend_from_slice(&payload[..37]);
+        signature_base.extend_from_slice(&client_hash);
+        let signature: P256Signature = signing_key.sign(&signature_base);
+
+        serde_json::json!({
+            "signature": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+            "alg": -7,
+            "message": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        })
     }
 
     fn joyid_webauthn_message(challenge: &str) -> String {
@@ -4231,6 +4479,10 @@ Done.",
         payload.extend(client_data.as_bytes());
 
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     fn quest_run_fixture() -> QuestRunDocument {
