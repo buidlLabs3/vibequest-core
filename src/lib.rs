@@ -304,6 +304,7 @@ struct LearningSessionDocument {
 struct SaveLearningSessionRequest {
     wallet: WalletProof,
     module_id: Option<String>,
+    source: Option<QuestSource>,
     module: LearningModule,
     selected_interests: Vec<String>,
     learner_goal: String,
@@ -1091,7 +1092,7 @@ impl MongoStore {
             id: id.clone(),
             user_address: address.to_string(),
             wallet,
-            source: QuestSource::OpenAi,
+            source: request.source.unwrap_or(QuestSource::OpenAi),
             module,
             selected_interests: compact_string_list(request.selected_interests, 8, 80),
             learner_goal: clamp_text(request.learner_goal, 360),
