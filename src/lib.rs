@@ -85,7 +85,13 @@ struct HealthResponse {
     ai_layer: AiLayer,
     integrations: IntegrationStatus,
     missing: Vec<&'static str>,
+    diagnostics: HealthDiagnostics,
     timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthDiagnostics {
+    mongodb: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -822,21 +828,27 @@ impl MongoStore {
     }
 
     async fn is_available(&self) -> bool {
+        self.availability_diagnostic().await.is_ok()
+    }
+
+    async fn availability_diagnostic(&self) -> Result<(), String> {
         if !self.is_configured() {
-            return false;
+            return Err("MONGODB_URI is not configured".to_string());
         }
 
         tokio::time::timeout(Duration::from_secs(4), async {
-            let Ok(database) = self.database().await else {
-                return false;
-            };
+            let database = self.database().await.map_err(|error| error.to_string())?;
             let mut command = Document::new();
             command.insert("ping", 1);
 
-            database.run_command(command).await.is_ok()
+            database
+                .run_command(command)
+                .await
+                .map(|_| ())
+                .map_err(|error| sanitize_mongodb_error(&error.to_string()))
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or_else(|_| Err("MongoDB ping timed out after 4 seconds".to_string()))
     }
 
     async fn database(&self) -> Result<Database, ApiError> {
@@ -2064,7 +2076,14 @@ impl ReasoningEffort {
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let integrations = integration_status(&state).await;
+    let mongodb_diagnostic = state.store.availability_diagnostic().await;
+    let integrations = IntegrationStatus {
+        openai: state.openai.api_key.is_some(),
+        ckb_rpc: state.config.ckb_rpc_url.is_some(),
+        fiber_rpc: state.config.fiber_rpc_url.is_some(),
+        fiber_payout: state.fiber.is_ready(),
+        mongodb: mongodb_diagnostic.is_ok(),
+    };
     let missing = missing_integrations(&state, &integrations);
 
     Json(HealthResponse {
@@ -2074,6 +2093,9 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         ai_layer: AiLayer::OpenAi,
         integrations,
         missing,
+        diagnostics: HealthDiagnostics {
+            mongodb: mongodb_diagnostic.err(),
+        },
         timestamp: Utc::now(),
     })
 }
@@ -2464,6 +2486,24 @@ fn warn_missing_integrations(state: &AppState) {
             missing = missing.join(", "),
             "vibequest-core is not fully configured"
         );
+    }
+}
+
+fn sanitize_mongodb_error(error: &str) -> String {
+    let lower = error.to_lowercase();
+
+    if lower.contains("authentication") || lower.contains("auth") {
+        "MongoDB authentication failed; verify username, password, and database user permissions"
+            .to_string()
+    } else if lower.contains("server selection") || lower.contains("no available servers") {
+        "MongoDB server selection failed; verify Atlas network access, URI host, and cluster availability".to_string()
+    } else if lower.contains("tls") || lower.contains("ssl") || lower.contains("alert") {
+        "MongoDB TLS handshake failed; verify Atlas connectivity from Vercel and cluster TLS settings".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "MongoDB connection timed out; verify Atlas network access and cluster health".to_string()
+    } else {
+        "MongoDB ping failed; inspect Atlas network access, credentials, and cluster health"
+            .to_string()
     }
 }
 
