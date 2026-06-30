@@ -232,6 +232,34 @@ struct LearningTutorAiResponse {
     references: Vec<LearningResource>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CodeTutorRequest {
+    quest_title: String,
+    quest_objective: String,
+    question: String,
+    files: Vec<WorkbenchFile>,
+    challenge: Option<QuestChallengeBrief>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodeTutorResponse {
+    source: QuestSource,
+    answer: String,
+    code_walkthrough: Vec<String>,
+    common_misunderstanding: String,
+    follow_up_question: String,
+    references: Vec<LearningResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodeTutorAiResponse {
+    answer: String,
+    code_walkthrough: Vec<String>,
+    common_misunderstanding: String,
+    follow_up_question: String,
+    references: Vec<LearningResource>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LearningTutorMessage {
     id: String,
@@ -1526,6 +1554,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ai/quests/generate", post(generate_quest))
         .route("/ai/learning/module", post(generate_learning_module))
         .route("/ai/learning/tutor", post(answer_learning_question))
+        .route("/ai/code/tutor", post(answer_code_question))
         .layer(cors_layer(&state.config))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1787,6 +1816,64 @@ impl OpenAiClient {
             answer: clamp_text(answer.answer, 900),
             why_it_matters: clamp_text(answer.why_it_matters, 500),
             follow_up_question: clamp_text(answer.follow_up_question, 220),
+            references: compact_learning_resources(answer.references),
+        })
+    }
+
+    async fn answer_code_question(
+        &self,
+        request: &CodeTutorRequest,
+    ) -> Result<CodeTutorResponse, ApiError> {
+        let Some(api_key) = self.api_key.as_ref() else {
+            return Err(ApiError::MissingOpenAiKey);
+        };
+
+        let prompt = code_tutor_prompt(request);
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": prompt,
+            "reasoning": {
+                "effort": self.reasoning_effort.serverless_safe()
+            },
+            "max_output_tokens": TUTOR_OUTPUT_TOKENS,
+            "store": !self.disable_response_storage,
+            "text": {
+                "format": {
+                    "type": "json_object"
+                }
+            }
+        });
+
+        let response = self
+            .http
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(api_key)
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ApiError::OpenAiTransport(error.to_string()))?;
+
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .map_err(|error| ApiError::OpenAiTransport(error.to_string()))?;
+
+        if !status.is_success() {
+            return Err(ApiError::OpenAiStatus {
+                status,
+                body: truncate_error_body(&response_body),
+            });
+        }
+
+        let answer = parse_openai_json_response::<CodeTutorAiResponse>(&response_body)?;
+        Ok(CodeTutorResponse {
+            source: QuestSource::OpenAi,
+            answer: clamp_text(answer.answer, 900),
+            code_walkthrough: compact_string_list(answer.code_walkthrough, 5, 220),
+            common_misunderstanding: clamp_text(answer.common_misunderstanding, 360),
+            follow_up_question: clamp_text(answer.follow_up_question, 260),
             references: compact_learning_resources(answer.references),
         })
     }
@@ -2105,6 +2192,33 @@ async fn answer_learning_question(
     }
 
     Ok(Json(state.openai.answer_learning_question(&request).await?))
+}
+
+async fn answer_code_question(
+    State(state): State<Arc<AppState>>,
+    Json(mut request): Json<CodeTutorRequest>,
+) -> Result<Json<CodeTutorResponse>, ApiError> {
+    if request.question.trim().chars().count() < 4 || request.files.is_empty() {
+        return Err(ApiError::InvalidPrompt);
+    }
+
+    request.quest_title = clamp_text(request.quest_title, 120);
+    request.quest_objective = clamp_text(request.quest_objective, 500);
+    request.question = clamp_text(request.question, 500);
+    request.files = request
+        .files
+        .into_iter()
+        .take(4)
+        .map(|mut file| {
+            file.path = clamp_text(file.path, 160);
+            file.language = clamp_text(file.language, 40);
+            file.content = compact_file_content(&file.content, 80);
+            file
+        })
+        .filter(|file| !file.path.trim().is_empty() && !file.content.trim().is_empty())
+        .collect();
+
+    Ok(Json(state.openai.answer_code_question(&request).await?))
 }
 
 async fn api_get_learning_session(
@@ -2905,6 +3019,66 @@ Rules:
         goal = request.learner_goal.trim(),
         background = request.background.trim(),
         pace = request.pace.trim(),
+    )
+}
+
+fn code_tutor_prompt(request: &CodeTutorRequest) -> String {
+    let files = request
+        .files
+        .iter()
+        .map(|file| {
+            format!(
+                "FILE: {path} ({language})\n```\n{content}\n```",
+                path = file.path.trim(),
+                language = file.language.trim(),
+                content = file.content.trim(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let challenge = request
+        .challenge
+        .as_ref()
+        .map(|brief| {
+            format!(
+                "Invariant: {invariant}\nAttack scenario: {attack}\nCode focus: {code}\nTest focus: {test}",
+                invariant = brief.invariant.trim(),
+                attack = brief.attack_scenario.trim(),
+                code = brief.code_focus.trim(),
+                test = brief.test_focus.trim(),
+            )
+        })
+        .unwrap_or_else(|| "No structured challenge brief supplied.".to_string());
+
+    format!(
+        r#"Return minified JSON only.
+No markdown. No prose outside JSON.
+
+Quest: {title}
+Objective: {objective}
+Challenge context:
+{challenge}
+
+Generated files:
+{files}
+
+Learner question: {question}
+
+Keys exactly: answer,code_walkthrough,common_misunderstanding,follow_up_question,references.
+Rules:
+- Ground the answer in the generated files. Mention file paths, functions, fields, and tests when useful.
+- Teach the CKB/Fiber concept behind the code, then explain the vibecoding mistake this prevents.
+- If the learner asks for a patch, describe the change and the denial test to add.
+- code_walkthrough: 3-5 short bullets, each tied to a concrete line/function/field in the generated files.
+- common_misunderstanding: name the likely wrong mental model and correct it.
+- follow_up_question: ask one question that checks whether the learner truly understood this code.
+- references: 2-3 authoritative links with title,url,reason. Prefer CKB Docs, Fiber repo, JoyID docs when relevant.
+- Keep answer under 170 words."#,
+        title = request.quest_title.trim(),
+        objective = request.quest_objective.trim(),
+        challenge = challenge,
+        files = files,
+        question = request.question.trim(),
     )
 }
 
