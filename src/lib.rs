@@ -239,6 +239,8 @@ struct CodeTutorRequest {
     question: String,
     files: Vec<WorkbenchFile>,
     challenge: Option<QuestChallengeBrief>,
+    run_id: Option<String>,
+    wallet: Option<WalletProof>,
 }
 
 #[derive(Debug, Serialize)]
@@ -249,6 +251,7 @@ struct CodeTutorResponse {
     common_misunderstanding: String,
     follow_up_question: String,
     references: Vec<LearningResource>,
+    persistence: PersistenceStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -579,6 +582,8 @@ struct QuestRunDocument {
     progress: QuestProgress,
     #[serde(default)]
     boss_attempts: Vec<BossAttempt>,
+    #[serde(default)]
+    code_tutor_messages: Vec<CodeTutorMessage>,
     status: QuestRunStatus,
     created_at: BsonDateTime,
     updated_at: BsonDateTime,
@@ -746,6 +751,7 @@ struct QuestRunRecord {
     ship_requirements: ShipRequirements,
     progress: QuestProgress,
     boss_attempts: Vec<BossAttempt>,
+    code_tutor_messages: Vec<CodeTutorMessage>,
     status: QuestRunStatus,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -779,6 +785,18 @@ struct BossAttemptRequest {
     correct: bool,
     feedback: String,
     follow_up_question: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodeTutorMessage {
+    id: String,
+    role: String,
+    text: String,
+    code_walkthrough: Vec<String>,
+    common_misunderstanding: Option<String>,
+    follow_up_question: Option<String>,
+    references: Vec<LearningResource>,
+    created_at: DateTime<Utc>,
 }
 
 impl MongoStore {
@@ -889,6 +907,7 @@ impl MongoStore {
                     && response.ship_requirements.fiber_rpc_ready,
             ),
             boss_attempts: Vec::new(),
+            code_tutor_messages: Vec::new(),
             status: QuestRunStatus::InProgress,
             created_at: now,
             updated_at: now,
@@ -1168,6 +1187,55 @@ impl MongoStore {
         Ok(run.into())
     }
 
+    async fn append_code_tutor_exchange(
+        &self,
+        run_id: &str,
+        wallet: &WalletProof,
+        request: &CodeTutorRequest,
+        answer: &CodeTutorResponse,
+    ) -> Result<(), ApiError> {
+        if !self.is_configured() {
+            return Ok(());
+        }
+
+        validate_wallet_proof(wallet)?;
+        let mut run = self.get_run(run_id).await?;
+        if run.user_address != wallet.address.trim() {
+            return Err(ApiError::WalletMismatch);
+        }
+
+        let now = Utc::now();
+        run.code_tutor_messages.push(CodeTutorMessage {
+            id: format!("learner-{}", now.timestamp_millis()),
+            role: "learner".to_string(),
+            text: clamp_text(request.question.clone(), 700),
+            code_walkthrough: Vec::new(),
+            common_misunderstanding: None,
+            follow_up_question: None,
+            references: Vec::new(),
+            created_at: now,
+        });
+        run.code_tutor_messages.push(CodeTutorMessage {
+            id: format!("mentor-{}", now.timestamp_millis()),
+            role: "mentor".to_string(),
+            text: answer.answer.clone(),
+            code_walkthrough: answer.code_walkthrough.clone(),
+            common_misunderstanding: Some(answer.common_misunderstanding.clone()),
+            follow_up_question: Some(answer.follow_up_question.clone()),
+            references: answer.references.clone(),
+            created_at: now,
+        });
+        run.code_tutor_messages = compact_code_tutor_messages(run.code_tutor_messages);
+        run.updated_at = BsonDateTime::now();
+
+        self.quest_runs()
+            .await?
+            .replace_one(doc! { "_id": run_id }, &run)
+            .await?;
+
+        Ok(())
+    }
+
     async fn complete_quest(
         &self,
         run_id: &str,
@@ -1339,6 +1407,7 @@ impl From<QuestRunDocument> for QuestRunRecord {
             ship_requirements: run.ship_requirements,
             progress: run.progress,
             boss_attempts: run.boss_attempts,
+            code_tutor_messages: run.code_tutor_messages,
             status: run.status,
             created_at: bson_datetime_to_utc(run.created_at),
             updated_at: bson_datetime_to_utc(run.updated_at),
@@ -1875,6 +1944,10 @@ impl OpenAiClient {
             common_misunderstanding: clamp_text(answer.common_misunderstanding, 360),
             follow_up_question: clamp_text(answer.follow_up_question, 260),
             references: compact_learning_resources(answer.references),
+            persistence: PersistenceStatus {
+                saved: false,
+                warning: None,
+            },
         })
     }
 }
@@ -2218,7 +2291,32 @@ async fn answer_code_question(
         .filter(|file| !file.path.trim().is_empty() && !file.content.trim().is_empty())
         .collect();
 
-    Ok(Json(state.openai.answer_code_question(&request).await?))
+    let mut answer = state.openai.answer_code_question(&request).await?;
+
+    if let (Some(run_id), Some(wallet)) = (request.run_id.as_deref(), request.wallet.as_ref()) {
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            state
+                .store
+                .append_code_tutor_exchange(run_id, wallet, &request, &answer),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                answer.persistence.saved = true;
+            }
+            Ok(Err(error @ (ApiError::Database(_) | ApiError::DatabaseUnavailable))) => {
+                warn!(%error, "code tutor answered but persistence is degraded");
+                answer.persistence.warning = Some(persistence_degraded_warning());
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                answer.persistence.warning = Some(persistence_degraded_warning());
+            }
+        }
+    }
+
+    Ok(Json(answer))
 }
 
 async fn api_get_learning_session(
@@ -2721,6 +2819,35 @@ fn document_to_checkpoint_answers(document: Document) -> std::collections::BTree
             mongodb::bson::Bson::Double(value) => Some((key, value as i64)),
             _ => None,
         })
+        .collect()
+}
+
+fn compact_code_tutor_messages(messages: Vec<CodeTutorMessage>) -> Vec<CodeTutorMessage> {
+    messages
+        .into_iter()
+        .filter(|message| {
+            (message.role == "learner" || message.role == "mentor")
+                && !message.text.trim().is_empty()
+        })
+        .map(|message| CodeTutorMessage {
+            id: clamp_text(message.id, 80),
+            role: message.role,
+            text: clamp_text(message.text, 900),
+            code_walkthrough: compact_string_list(message.code_walkthrough, 5, 220),
+            common_misunderstanding: message
+                .common_misunderstanding
+                .map(|value| clamp_text(value, 360)),
+            follow_up_question: message
+                .follow_up_question
+                .map(|value| clamp_text(value, 260)),
+            references: compact_learning_resources(message.references),
+            created_at: message.created_at,
+        })
+        .rev()
+        .take(40)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
         .collect()
 }
 
@@ -3830,6 +3957,7 @@ Done.",
                 shipped: false,
             },
             boss_attempts: Vec::new(),
+            code_tutor_messages: Vec::new(),
             status: QuestRunStatus::InProgress,
             created_at: now,
             updated_at: now,
