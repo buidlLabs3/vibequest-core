@@ -36,7 +36,7 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://share-ai.ckbdev.com";
 const DEFAULT_OPENAI_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Minimal;
 const DEFAULT_OPENAI_TIMEOUT_SECONDS: u64 = 52;
 const QUICK_QUEST_OUTPUT_TOKENS: u16 = 1_050;
-const LEARNING_MODULE_OUTPUT_TOKENS: u16 = 620;
+const LEARNING_MODULE_OUTPUT_TOKENS: u16 = 650;
 const TUTOR_OUTPUT_TOKENS: u16 = 520;
 
 #[derive(Clone)]
@@ -219,22 +219,22 @@ struct LearningResource {
 }
 
 #[derive(Debug, Deserialize)]
-struct LearningModulePlan {
-    title: String,
-    outcome: String,
-    lessons: Vec<LearningLessonPlan>,
-    capstone_quest_prompt: String,
+struct AiLearningModuleCompact {
+    t: String,
+    l: Vec<AiLearningLessonCompact>,
 }
 
 #[derive(Debug, Deserialize)]
-struct LearningLessonPlan {
-    title: String,
-    focus: String,
-    checkpoint_question: String,
-    correct_answer: String,
-    misconception: String,
-    quest_bridge: String,
-    concepts: Vec<String>,
+struct AiLearningLessonCompact {
+    t: String,
+    e: String,
+    s: String,
+    q: String,
+    a: String,
+    #[serde(default, deserialize_with = "deserialize_string_vec")]
+    b: Vec<String>,
+    #[serde(default)]
+    ci: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,14 +537,14 @@ enum ApiError {
     InvalidWalletSignature,
     #[error("OpenAI is not configured. Add OPENAI_API_KEY before generating live quests.")]
     MissingOpenAiKey,
-    #[error("AI quest generation is temporarily unavailable. Please regenerate in a moment.")]
+    #[error("AI generation is temporarily unavailable. Please regenerate in a moment.")]
     OpenAiTransport(String),
-    #[error("AI quest generation is temporarily unavailable. Please regenerate in a moment.")]
+    #[error("AI generation is temporarily unavailable. Please regenerate in a moment.")]
     OpenAiStatus {
         status: ReqwestStatusCode,
         body: String,
     },
-    #[error("The AI response was incomplete. Please regenerate the quest.")]
+    #[error("The AI response was incomplete. Please regenerate.")]
     InvalidAiResponse,
     #[error("Quest history is temporarily unavailable because MongoDB is not configured.")]
     DatabaseUnavailable,
@@ -1863,18 +1863,40 @@ impl OpenAiClient {
         &self,
         request: &GenerateLearningModuleRequest,
     ) -> Result<LearningModule, ApiError> {
+        let prompt = learning_module_prompt(request);
+        let compact = self
+            .post_openai_json::<AiLearningModuleCompact>(
+                prompt,
+                LEARNING_MODULE_OUTPUT_TOKENS,
+                ReasoningEffort::Minimal,
+                Duration::from_secs(30),
+            )
+            .await?;
+
+        build_learning_module_from_compact_ai(request, compact)
+    }
+
+    async fn post_openai_json<T>(
+        &self,
+        prompt: String,
+        max_output_tokens: u16,
+        reasoning_effort: ReasoningEffort,
+        timeout: Duration,
+    ) -> Result<T, ApiError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
         let Some(api_key) = self.api_key.as_ref() else {
             return Err(ApiError::MissingOpenAiKey);
         };
 
-        let prompt = learning_module_plan_prompt(request);
         let body = serde_json::json!({
             "model": self.model,
             "input": prompt,
             "reasoning": {
-                "effort": ReasoningEffort::Minimal
+                "effort": reasoning_effort
             },
-            "max_output_tokens": LEARNING_MODULE_OUTPUT_TOKENS,
+            "max_output_tokens": max_output_tokens,
             "store": !self.disable_response_storage,
             "text": {
                 "format": {
@@ -1887,11 +1909,25 @@ impl OpenAiClient {
             .http
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(api_key)
-            .timeout(self.timeout)
+            .timeout(timeout)
             .json(&body)
             .send()
             .await
-            .map_err(|error| ApiError::OpenAiTransport(error.to_string()))?;
+            .map_err(|error| {
+                let detail = if error.is_timeout() {
+                    format!(
+                        "{error}; source: {}",
+                        error
+                            .source()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "request timed out".to_string())
+                    )
+                } else {
+                    error.to_string()
+                };
+
+                ApiError::OpenAiTransport(detail)
+            })?;
 
         let status = response.status();
         let response_body = response
@@ -1906,8 +1942,7 @@ impl OpenAiClient {
             });
         }
 
-        let plan = parse_openai_json_response::<LearningModulePlan>(&response_body)?;
-        build_learning_module_from_plan(request, plan)
+        parse_openai_json_response::<T>(&response_body)
     }
 
     async fn answer_learning_question(
@@ -2346,28 +2381,13 @@ async fn generate_learning_module(
         return Err(ApiError::InvalidPrompt);
     }
 
-    let (module, source, warning) = match state.openai.generate_learning_module(&request).await {
-        Ok(module) => (module, QuestSource::OpenAi, None),
-        Err(
-            error @ (ApiError::OpenAiTransport(_)
-            | ApiError::OpenAiStatus { .. }
-            | ApiError::InvalidAiResponse),
-        ) => {
-            warn!(%error, "learning module AI generation degraded; using core fallback");
-            (
-                fallback_learning_module(&request),
-                QuestSource::CoreFallback,
-                Some("The live AI lesson generator did not return a complete module fast enough, so VibeQuest built a structured path from your selected interests and goal. You can learn now and regenerate later for an OpenAI-authored version.".to_string()),
-            )
-        }
-        Err(error) => return Err(error),
-    };
+    let module = state.openai.generate_learning_module(&request).await?;
 
     Ok(Json(GenerateLearningModuleResponse {
         module_id: Uuid::new_v4(),
-        source,
+        source: QuestSource::OpenAi,
         module,
-        warning,
+        warning: None,
     }))
 }
 
@@ -3539,6 +3559,28 @@ fn compact_learning_resources(resources: Vec<LearningResource>) -> Vec<LearningR
     compacted
 }
 
+fn deserialize_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                Value::String(text) => Some(text),
+                other => Some(other.to_string()),
+            })
+            .collect(),
+        Value::String(text) => text
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
 fn default_learning_resources() -> Vec<LearningResource> {
     vec![
         LearningResource {
@@ -3677,14 +3719,13 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
-fn build_learning_module_from_plan(
+fn build_learning_module_from_compact_ai(
     request: &GenerateLearningModuleRequest,
-    mut plan: LearningModulePlan,
+    compact: AiLearningModuleCompact,
 ) -> Result<LearningModule, ApiError> {
-    if plan.lessons.len() < 3 {
+    if compact.l.len() < 3 {
         return Err(ApiError::InvalidAiResponse);
     }
-    plan.lessons.truncate(3);
 
     let interests = request
         .interests
@@ -3694,7 +3735,7 @@ fn build_learning_module_from_plan(
         .take(4)
         .collect::<Vec<_>>();
     let focus = if interests.is_empty() {
-        "CKB/Fiber fundamentals".to_string()
+        "CKB/Fiber".to_string()
     } else {
         interests.join(" + ")
     };
@@ -3704,305 +3745,233 @@ fn build_learning_module_from_plan(
         request.background.trim().to_string()
     };
 
-    let mut lessons = Vec::new();
-    for (index, lesson) in plan.lessons.into_iter().enumerate() {
-        let title = non_empty_or(clamp_text(lesson.title, 80), "CKB/Fiber Trust Boundary");
-        let focus_text = non_empty_or(
-            clamp_text(lesson.focus, 220),
-            "Map the protocol concept to the exact code field that must be trusted and tested.",
-        );
-        let concepts = compact_string_list(lesson.concepts, 5, 80);
-        let concept_text = if concepts.is_empty() {
-            "trust boundary".to_string()
-        } else {
-            concepts.join(", ")
-        };
-        let correct = non_empty_or(
-            clamp_text(lesson.correct_answer, 220),
-            "Bind the proof to the exact reader, content, run, CKB cell, and Fiber state being accepted.",
-        );
-        let misconception = non_empty_or(
-            clamp_text(lesson.misconception, 220),
-            "Trusting a string-shaped proof without a denial test leaves replay risk hidden.",
-        );
-        let checkpoint_question = non_empty_or(
-            clamp_text(lesson.checkpoint_question, 260),
-            "Which proof boundary must the generated code defend?",
-        );
-        let quest_bridge = non_empty_or(
-            clamp_text(lesson.quest_bridge, 280),
-            "Generate a verifier quest with one accepting branch and one denial test that mutates the trusted field.",
-        );
-        let wrong_options = match index {
-            0 => vec![
-                LearningOption {
-                    label: "Only check that the wallet is connected in the frontend.".to_string(),
-                    feedback: "Wallet connection is not enough; the verifier must bind the proof to CKB/Fiber state.".to_string(),
-                },
-                LearningOption {
-                    label: "Accept any witness or receipt string that contains the expected id.".to_string(),
-                    feedback: "String inclusion can be copied. The proof must be scoped to the exact state transition.".to_string(),
-                },
-                LearningOption {
-                    label: "Ship once the happy-path test passes.".to_string(),
-                    feedback: "Happy paths do not prove replay resistance; mutate the trusted field.".to_string(),
-                },
-            ],
-            1 => vec![
-                LearningOption {
-                    label: "A non-empty HTLC preimage proves every paid read.".to_string(),
-                    feedback: "A preimage can be reused unless reader, content, run, amount, and state are bound.".to_string(),
-                },
-                LearningOption {
-                    label: "CKB RPC readiness proves this specific receipt is valid.".to_string(),
-                    feedback: "Infrastructure health is not transaction-level proof.".to_string(),
-                },
-                LearningOption {
-                    label: "The UI route protects the content.".to_string(),
-                    feedback: "Frontend routes can be bypassed; backend/verifier checks carry the trust boundary.".to_string(),
-                },
-            ],
-            _ => vec![
-                LearningOption {
-                    label: "Generate code first, then skip the explanation if it compiles.".to_string(),
-                    feedback: "VibeQuest requires understanding: inspect, test, explain, then ship.".to_string(),
-                },
-                LearningOption {
-                    label: "Ask for more files instead of a sharper invariant.".to_string(),
-                    feedback: "More code can hide the bug. A narrow invariant plus denial test teaches better.".to_string(),
-                },
-                LearningOption {
-                    label: "Claim rewards because the quest has a title and badge.".to_string(),
-                    feedback: "Badges must follow proof of understanding, not metadata.".to_string(),
-                },
-            ],
-        };
-        let correct_index = index.min(3);
-        let correct_option = LearningOption {
-            label: correct.clone(),
-            feedback: "Correct. This names the proof boundary and gives you a concrete denial test target.".to_string(),
-        };
-        let mut wrong_iter = wrong_options.into_iter();
-        let options = (0..4)
-            .map(|option_index| {
-                if option_index == correct_index {
-                    correct_option.clone()
-                } else {
-                    wrong_iter.next().unwrap_or_else(|| LearningOption {
-                        label: misconception.clone(),
-                        feedback: "This is the misconception to remove before generating a quest."
-                            .to_string(),
-                    })
-                }
-            })
-            .collect::<Vec<_>>();
-
-        lessons.push(LearningLesson {
-            id: format!("lesson-{}", index + 1),
-            title,
-            why_it_matters: format!(
-                "For a {background}, this matters because vibecoded CKB/Fiber work fails when {misconception}",
-            ),
-            explanation: format!(
-                "{focus_text} In practice, inspect the generated code for {concept_text}. Then write or read one denial test that changes the trusted field. If the verifier still accepts after that mutation, the lesson has found a real bug to fix before shipping."
-            ),
-            concepts: if concepts.is_empty() {
-                vec!["CKB/Fiber trust boundary".to_string(), "denial test".to_string()]
-            } else {
-                concepts
-            },
-            checkpoint: LearningCheckpoint {
-                question: checkpoint_question,
-                options,
-                correct_index,
-                explanation: format!(
-                    "The right answer names what must be bound and what attack the denial test blocks: {correct}"
-                ),
-                follow_up_question: "Which single field would you mutate first to prove this understanding in code?".to_string(),
-            },
-            quest_bridge,
-        });
-    }
+    let lessons = compact
+        .l
+        .into_iter()
+        .take(3)
+        .enumerate()
+        .map(|(index, lesson)| compact_ai_lesson_to_learning_lesson(index, &background, lesson))
+        .collect::<Result<Vec<_>, _>>()?;
 
     compact_learning_module(LearningModule {
         title: non_empty_or(
-            clamp_text(plan.title, 80),
-            &format!("{} Learning Path", clamp_text(focus.clone(), 48)),
+            compact.t,
+            &format!("VibeQuest: {} Deep Dive", clamp_text(focus.clone(), 52)),
         ),
         learner_profile: format!(
-            "A {background} learning {focus} through AI-planned lessons, checkpoint questions, tutor support, and practical quest handoffs."
+            "A {background} learning {focus} through fast OpenAI-authored lessons, code snippets, checkpoints, tutor support, and practical quest handoffs."
         ),
-        outcome: non_empty_or(
-            clamp_text(plan.outcome, 220),
-            "Explain the CKB/Fiber trust boundary, identify replay or mismatch risks, and generate a practical verifier quest.",
+        outcome: format!(
+            "Explain {focus} trust boundaries, read generated verifier code, answer code-aware checkpoints, and turn passed lessons into quests."
         ),
         lessons,
-        capstone_quest_prompt: non_empty_or(
-            clamp_text(plan.capstone_quest_prompt, 360),
-            "Build a CKB/Fiber verifier quest with one accepting branch and denial tests for replayed or mismatched proof data.",
+        capstone_quest_prompt: format!(
+            "Generate a {focus} verifier quest with proof binding, denial tests, a boss question, and a reward-safe ship gate."
         ),
         resources: default_learning_resources(),
     })
 }
 
-fn fallback_learning_module(request: &GenerateLearningModuleRequest) -> LearningModule {
-    let interests = request
-        .interests
-        .iter()
-        .map(|interest| interest.trim())
-        .filter(|interest| !interest.is_empty())
-        .take(3)
-        .collect::<Vec<_>>();
-    let focus = if interests.is_empty() {
-        "CKB/Fiber fundamentals".to_string()
-    } else {
-        interests.join(" + ")
-    };
-    let background = if request.background.trim().is_empty() {
-        "builder".to_string()
-    } else {
-        request.background.trim().to_string()
-    };
-    let goal = request.learner_goal.trim().to_lowercase();
-    let wants_product = focus.to_lowercase().contains("product")
-        || focus.to_lowercase().contains("community")
-        || goal.contains("non-engineer")
-        || goal.contains("explain");
-    let wants_economics = focus.to_lowercase().contains("xudt")
-        || goal.contains("payout")
-        || goal.contains("economics")
-        || goal.contains("split");
-    let wants_security = focus.to_lowercase().contains("security")
-        || goal.contains("audit")
-        || goal.contains("replay")
-        || goal.contains("risk");
-    let outcome = if wants_product {
-        "Explain CKB/Fiber value and risk clearly, then review generated code without hand-waving."
-    } else if wants_economics {
-        "Verify xUDT payout logic, rounding, and reward claims before shipping generated code."
-    } else if wants_security {
-        "Find replay, mismatch, and stale-state bugs in generated CKB/Fiber code."
-    } else {
-        "Explain the CKB/Fiber trust boundary, identify replay or mismatch risks, and turn a completed lesson into a practical verifier quest."
-    };
-    let module_title = if wants_product {
-        format!("{} Product Risk Path", clamp_text(focus.clone(), 44))
-    } else if wants_economics {
-        format!("{} Economics Path", clamp_text(focus.clone(), 44))
-    } else if wants_security {
-        format!("{} Audit Path", clamp_text(focus.clone(), 44))
-    } else {
-        format!("{} Learning Path", clamp_text(focus.clone(), 48))
-    };
-
-    let mut lessons = vec![
-            LearningLesson {
-                id: "lesson-1".to_string(),
-                title: "Cells, Scripts, And Witnesses".to_string(),
-                why_it_matters: "Vibecoded CKB apps fail when learners cannot say which state is on-chain, which data is witness-provided, and which checks are local convenience only.".to_string(),
-                explanation: "CKB stores state in cells. A script controls whether a cell can be spent, and witnesses provide transaction-time evidence such as signatures or proof data. When AI generates a verifier, do not just ask if it compiles. Ask what cell it trusts, what script condition it assumes, and what witness field can be copied or changed by an attacker. The practical habit is to trace every accepting branch back to a cell, script, or witness condition and then create one denial case that mutates that condition.".to_string(),
-                concepts: vec!["cell state".to_string(), "lock/type scripts".to_string(), "witness evidence".to_string(), "trust boundary".to_string()],
-                checkpoint: LearningCheckpoint {
-                    question: "A generated verifier accepts a request because `witness.includes(cellId)`. What must you check before trusting it?".to_string(),
-                    options: vec![
-                        LearningOption { label: "Whether the witness is bound to the exact transaction/cell/script state being authorized.".to_string(), feedback: "Correct. A witness string alone is not proof unless it is scoped to the state transition you intend to accept.".to_string() },
-                        LearningOption { label: "Only whether the frontend wallet is connected.".to_string(), feedback: "Wallet connection helps identity, but it does not prove the generated business logic is safe.".to_string() },
-                        LearningOption { label: "Whether the generated code uses TypeScript types.".to_string(), feedback: "Types help shape data, but they do not prove the witness is authentic or non-replayable.".to_string() },
-                        LearningOption { label: "Whether the UI labels the request as paid.".to_string(), feedback: "UI state is not a trust boundary. The verifier must bind evidence to CKB/Fiber state.".to_string() },
-                    ],
-                    correct_index: 0,
-                    explanation: "The trusted claim must be bound to concrete cell/script/witness state, not only to a string that looks right.".to_string(),
-                    follow_up_question: "What denial test would you write if an attacker copied the witness from another cell?".to_string(),
-                },
-                quest_bridge: "Generate a quest that validates a witness against one expected CKB cell and includes a denial test for a mutated cell id.".to_string(),
-            },
-            LearningLesson {
-                id: "lesson-2".to_string(),
-                title: "Fiber Receipts And Replay Risk".to_string(),
-                why_it_matters: "Fiber-style payments are fast, but learners must still prove an invoice, preimage, or channel state cannot be reused across another user, run, or content item.".to_string(),
-                explanation: "A Fiber receipt is useful only when the verifier binds it to the thing being unlocked. The common vibecoding mistake is to check that a preimage exists or an invoice string starts with `fiber:` and forget to bind it to reader, content, amount, route, channel state, and current run. Your review loop is simple: name every field the verifier trusts, mutate one field in a denial test, and confirm access fails. If changing the reader, content id, run id, or channel state still passes, the generated code is reward-unsafe.".to_string(),
-                concepts: vec!["invoice binding".to_string(), "HTLC preimage".to_string(), "channel state".to_string(), "replay defense".to_string()],
-                checkpoint: LearningCheckpoint {
-                    question: "Which receipt check best blocks a paid-content replay attack?".to_string(),
-                    options: vec![
-                        LearningOption { label: "Accept any receipt with a non-empty preimage.".to_string(), feedback: "A copied preimage can unlock the wrong content if it is not scoped.".to_string() },
-                        LearningOption { label: "Bind receipt proof to reader, content id, amount, channel state, and current run.".to_string(), feedback: "Correct. Replay resistance comes from binding proof to the exact access being requested.".to_string() },
-                        LearningOption { label: "Hide the content behind a frontend route.".to_string(), feedback: "Frontend routes can be bypassed; the backend/verifier must enforce the proof.".to_string() },
-                        LearningOption { label: "Check only that CKB RPC is configured.".to_string(), feedback: "Infrastructure readiness does not validate a specific payment receipt.".to_string() },
-                    ],
-                    correct_index: 1,
-                    explanation: "The receipt must be scoped to the user/action/state, otherwise a valid payment artifact can be reused.".to_string(),
-                    follow_up_question: "Which single field would you mutate first to prove the replay test is meaningful?".to_string(),
-                },
-                quest_bridge: "Generate a Fiber receipt verifier quest with tests for missing receipt, wrong reader, wrong content id, and replayed run id.".to_string(),
-            },
-            LearningLesson {
-                id: "lesson-3".to_string(),
-                title: "From Lesson To Quest".to_string(),
-                why_it_matters: "The product goal is not reading docs forever. The learner should prove understanding by turning a concept into a small generated code artifact, tests, and an explanation.".to_string(),
-                explanation: "A strong VibeQuest lesson ends with a quest prompt that is narrow enough to test and rich enough to teach. Start with one invariant: for example, `paid access requires a Fiber proof bound to a CKB cell and reader`. Then ask AI to generate a verifier plus tests. Your job is to inspect the accepting branch, run the generated checks, answer the boss question, and patch or reject weak assumptions. This turns vibecoding from black-box output into a learning loop: ask, inspect, test, explain, ship.".to_string(),
-                concepts: vec!["invariant".to_string(), "denial test".to_string(), "boss explanation".to_string(), "quest handoff".to_string()],
-                checkpoint: LearningCheckpoint {
-                    question: "When should VibeQuest let a learner generate a quest from this lesson?".to_string(),
-                    options: vec![
-                        LearningOption { label: "Immediately, even if the learner skipped the checkpoint.".to_string(), feedback: "That recreates black-box vibecoding. The checkpoint proves readiness.".to_string() },
-                        LearningOption { label: "Only after they memorize every CKB term.".to_string(), feedback: "Memorization is less useful than proving the core invariant and failure path.".to_string() },
-                        LearningOption { label: "After they answer the checkpoint and can name the invariant the quest should test.".to_string(), feedback: "Correct. The quest should be generated from demonstrated understanding.".to_string() },
-                        LearningOption { label: "Only after reward payout is configured.".to_string(), feedback: "Rewards are separate; learning and verification can happen before payout execution.".to_string() },
-                    ],
-                    correct_index: 2,
-                    explanation: "The lesson-to-quest handoff should depend on understanding, not just button clicks.".to_string(),
-                    follow_up_question: "State one invariant your generated quest should enforce.".to_string(),
-                },
-                quest_bridge: "Generate a practical quest from the active lesson invariant and require one denial test before the boss answer unlocks.".to_string(),
-            },
-        ];
-
-    if wants_security {
-        lessons.swap(0, 1);
+fn compact_ai_lesson_to_learning_lesson(
+    index: usize,
+    background: &str,
+    lesson: AiLearningLessonCompact,
+) -> Result<LearningLesson, ApiError> {
+    if lesson.e.trim().chars().count() < 30
+        || lesson.q.trim().is_empty()
+        || lesson.a.trim().is_empty()
+    {
+        return Err(ApiError::InvalidAiResponse);
     }
 
-    if wants_product {
-        lessons[0].title = "Explain The Trust Boundary Without Hand-Waving".to_string();
-        lessons[0].why_it_matters = "Community and product contributors do not need to write every line, but they must identify what the generated system trusts and where users can be harmed.".to_string();
-        lessons[0].checkpoint.question = "A teammate says the app is safe because the wallet is connected and the UI says paid. What is the strongest response?".to_string();
-        lessons[0].checkpoint.options[0].label =
-            "Ask what CKB/Fiber proof the backend verifies and which replay case is rejected."
-                .to_string();
-        lessons[0].checkpoint.explanation = "A useful product review names the proof boundary and the failure case, not only the happy-path user story.".to_string();
-    }
+    let concepts = infer_learning_concepts(index, &lesson);
+    let correct_index = lesson.ci.min(3);
+    let correct_option = LearningOption {
+        label: lesson.a.clone(),
+        feedback:
+            "Correct. This answer names the proof or state boundary the generated code must defend."
+                .to_string(),
+    };
+    let mut wrong_answers = learning_wrong_options(lesson.b, index).into_iter();
+    let options = (0..4)
+        .map(|option_index| {
+            if option_index == correct_index {
+                Ok(correct_option.clone())
+            } else {
+                wrong_answers.next().ok_or(ApiError::InvalidAiResponse)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    if wants_economics {
-        lessons[1].title = "xUDT Splits And Over-Claiming Risk".to_string();
-        lessons[1].why_it_matters = "Payout bugs are learning bugs too: a generated split can look reasonable while rounding, recipient, or channel-state assumptions leak value.".to_string();
-        lessons[1].concepts = vec![
-            "xUDT amount".to_string(),
-            "basis points".to_string(),
-            "rounding".to_string(),
-            "over-claim denial test".to_string(),
-        ];
-        lessons[1].quest_bridge = "Generate an xUDT payout split quest with tests for wrong amount, wrong creator bps, and stale channel state.".to_string();
-    }
-
-    LearningModule {
-        title: module_title,
-        learner_profile: format!(
-            "A {background} learning {focus} through proof-first explanations, checkpoint questions, and practical quest handoffs."
+    let explanation = if lesson.s.trim().is_empty() {
+        lesson.e.clone()
+    } else {
+        format!("{}\n\nCode lens:\n{}", lesson.e.trim(), lesson.s.trim())
+    };
+    Ok(LearningLesson {
+        id: format!("lesson-{}", index + 1),
+        title: lesson.t,
+        why_it_matters: format!(
+            "For a {background}, this matters because vibecoded CKB/Fiber code can look plausible while trusting the wrong identity, payment, or settlement signal."
         ),
-        outcome: outcome.to_string(),
-        lessons,
-        capstone_quest_prompt: if wants_economics {
-            "Build a CKB/Fiber xUDT payout verifier that binds amount, creator split, channel state, JoyID identity, and denial tests for over-claiming.".to_string()
-        } else if wants_product {
-            "Build a CKB/Fiber explainer quest that maps product claims to verifier code, proof state, and one user-harm failure case.".to_string()
-        } else {
-            "Build a CKB/Fiber paid-access verifier that binds JoyID identity, a CKB cell proof, Fiber receipt state, and denial tests for replayed or mismatched proof data.".to_string()
+        explanation,
+        concepts,
+        checkpoint: LearningCheckpoint {
+            question: lesson.q,
+            options,
+            correct_index,
+            explanation: format!(
+                "The correct answer is: {}. That is the value or proof the backend must verify before the generated code deserves a badge.",
+                lesson.a
+            ),
+            follow_up_question: follow_up_for_lesson(index),
         },
-        resources: default_learning_resources(),
+        quest_bridge: quest_bridge_for_lesson(index),
+    })
+}
+
+fn learning_wrong_options(labels: Vec<String>, lesson_index: usize) -> Vec<LearningOption> {
+    let mut options = labels
+        .into_iter()
+        .filter(|label| !label.trim().is_empty())
+        .take(3)
+        .enumerate()
+        .map(|(index, label)| LearningOption {
+            label,
+            feedback: wrong_feedback_for_lesson(lesson_index, index),
+        })
+        .collect::<Vec<_>>();
+
+    let defaults = default_learning_wrong_options(lesson_index);
+    let mut default_iter = defaults.into_iter();
+    while options.len() < 3 {
+        if let Some(option) = default_iter.next() {
+            options.push(option);
+        } else {
+            break;
+        }
+    }
+
+    options
+}
+
+fn wrong_feedback_for_lesson(lesson_index: usize, option_index: usize) -> String {
+    match lesson_index {
+        0 => [
+            "UI or display data is not a JoyID signature verification step.",
+            "A string can be copied; bind it to challenge, origin, and CKB identity.",
+            "Frontend route state does not prove user authority.",
+        ],
+        1 => [
+            "A payment-looking artifact is useless unless amount, asset, expiry, and channel state are checked.",
+            "Infrastructure health is not proof that this invoice was paid.",
+            "Paid access must be enforced by backend/verifier logic, not UI state.",
+        ],
+        _ => [
+            "Repeated settlement events require idempotent handling, not visual confirmation.",
+            "Reward claims must be tied to a verified run and payment state.",
+            "Happy-path tests do not prove replay resistance.",
+        ],
+    }
+    .get(option_index)
+    .unwrap_or(&"This misses the exact proof boundary the verifier must defend.")
+    .to_string()
+}
+
+fn default_learning_wrong_options(lesson_index: usize) -> Vec<LearningOption> {
+    match lesson_index {
+        0 => vec![
+            LearningOption {
+                label: "Trust the submitted address because the UI says JoyID connected."
+                    .to_string(),
+                feedback: wrong_feedback_for_lesson(0, 0),
+            },
+            LearningOption {
+                label: "Accept a witness string if it contains the expected cell id.".to_string(),
+                feedback: wrong_feedback_for_lesson(0, 1),
+            },
+            LearningOption {
+                label: "Skip server-side proof checks after passkey login.".to_string(),
+                feedback: wrong_feedback_for_lesson(0, 2),
+            },
+        ],
+        1 => vec![
+            LearningOption {
+                label: "A non-empty HTLC preimage proves every paid read.".to_string(),
+                feedback: wrong_feedback_for_lesson(1, 0),
+            },
+            LearningOption {
+                label: "Fiber RPC readiness proves this exact invoice was paid.".to_string(),
+                feedback: wrong_feedback_for_lesson(1, 1),
+            },
+            LearningOption {
+                label: "The frontend route protects paid content.".to_string(),
+                feedback: wrong_feedback_for_lesson(1, 2),
+            },
+        ],
+        _ => vec![
+            LearningOption {
+                label: "Generate more files instead of one sharper invariant.".to_string(),
+                feedback: wrong_feedback_for_lesson(2, 0),
+            },
+            LearningOption {
+                label: "Claim rewards once the happy path compiles.".to_string(),
+                feedback: wrong_feedback_for_lesson(2, 1),
+            },
+            LearningOption {
+                label: "Treat the boss answer as optional after tests pass.".to_string(),
+                feedback: wrong_feedback_for_lesson(2, 2),
+            },
+        ],
     }
 }
 
-fn learning_module_plan_prompt(request: &GenerateLearningModuleRequest) -> String {
+fn infer_learning_concepts(index: usize, lesson: &AiLearningLessonCompact) -> Vec<String> {
+    let mut concepts = match index {
+        0 => vec!["JoyID signature", "CKB identity", "challenge nonce"],
+        1 => vec!["Fiber invoice", "HTLC", "channel state"],
+        _ => vec!["settlement", "idempotency", "reward claim"],
+    }
+    .into_iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+
+    let lower = format!("{} {} {} {}", lesson.t, lesson.e, lesson.s, lesson.q).to_lowercase();
+    for (needle, concept) in [
+        ("xudt", "xUDT"),
+        ("witness", "witness"),
+        ("outpoint", "outpoint"),
+        ("replay", "replay defense"),
+        ("preimage", "HTLC preimage"),
+    ] {
+        if lower.contains(needle) && !concepts.iter().any(|value| value == concept) {
+            concepts.push(concept.to_string());
+        }
+    }
+
+    concepts.truncate(5);
+    concepts
+}
+
+fn follow_up_for_lesson(index: usize) -> String {
+    match index {
+        0 => "Which exact JoyID message field would you bind to stop replay across another route?",
+        1 => "Which Fiber invoice or channel-state field would you mutate first in a denial test?",
+        _ => "How would you make the reward claim idempotent if the settlement callback arrives twice?",
+    }
+    .to_string()
+}
+
+fn quest_bridge_for_lesson(index: usize) -> String {
+    match index {
+        0 => "Generate a JoyID proof-binding verifier quest with a denial test for a replayed challenge.",
+        1 => "Generate a Fiber invoice verifier quest with denial tests for wrong amount, stale expiry, and replayed channel state.",
+        _ => "Generate a settlement/reward quest with idempotent completion, proof envelope checks, and a boss explanation.",
+    }
+    .to_string()
+}
+
+fn learning_module_prompt(request: &GenerateLearningModuleRequest) -> String {
     let nonce = Uuid::new_v4();
     let interests = request
         .interests
@@ -4019,24 +3988,7 @@ fn learning_module_plan_prompt(request: &GenerateLearningModuleRequest) -> Strin
     };
 
     format!(
-        r#"Return minified JSON only.
-Create a compact VibeQuest learning plan. Do not write full lessons.
-Interests: {interests}
-Goal: {goal}
-Background: {background}
-Pace: {pace}
-Seed: {nonce}
-
-Keys exactly: title,outcome,lessons,capstone_quest_prompt.
-lessons: exactly 3 objects. Each lesson keys exactly: title,focus,checkpoint_question,correct_answer,misconception,quest_bridge,concepts.
-Rules:
-- Keep every string under 140 characters.
-- concepts: 3-5 short CKB/Fiber/JoyID terms.
-- correct_answer must name a concrete proof binding, trusted field, or denial test.
-- misconception must be a realistic vibecoding mistake.
-- quest_bridge must be a concrete code quest prompt using verifier/test language.
-- Make lesson 1 conceptual, lesson 2 code/security focused, lesson 3 practice/quest focused.
-- Vary correct answer positions are handled by backend; do not include options."#,
+        r#"Return minified JSON only. Keys t,l. l exactly 3 objects with keys t,e,s,q,a,b,ci. Topic: CKB/Fiber/JoyID learning for vibecoders. Interests: {interests}. Goal: {goal}. Background: {background}. Pace: {pace}. Seed: {nonce}. e max 30 words. s one TypeScript or Rust line. b exactly 3 short wrong answer labels. ci values 0,2,1. Cover JoyID signature/CKB identity, Fiber invoice/HTLC/channel state/replay, settlement/idempotency/payout integrity."#,
         goal = request.learner_goal.trim(),
         background = request.background.trim(),
         pace = request.pace.trim(),
@@ -4755,56 +4707,43 @@ Done.",
     }
 
     #[test]
-    fn ai_learning_plan_expands_into_full_module() {
+    fn compact_ai_module_builder_keeps_authored_text() {
         let request = GenerateLearningModuleRequest {
             interests: vec!["CKB Foundations".to_string(), "Fiber Payments".to_string()],
-            learner_goal: "Understand CKB/Fiber code deeply".to_string(),
+            learner_goal: "Understand generated CKB/Fiber verifier code".to_string(),
             background: "Backend dev".to_string(),
-            pace: "Focused".to_string(),
+            pace: "Deep dive".to_string(),
         };
-        let plan = LearningModulePlan {
-            title: "CKB/Fiber Proof Path".to_string(),
-            outcome: "Explain proof boundaries and generate verifier quests.".to_string(),
-            capstone_quest_prompt: "Build a Fiber receipt verifier with denial tests.".to_string(),
-            lessons: vec![
-                LearningLessonPlan {
-                    title: "Cells To Trust Boundaries".to_string(),
-                    focus: "Map CKB cells, scripts, and witnesses to verifier fields.".to_string(),
-                    checkpoint_question: "What must a witness prove?".to_string(),
-                    correct_answer: "Bind witness data to the exact CKB cell and script state.".to_string(),
-                    misconception: "Checking witness.includes(cellId) is enough.".to_string(),
-                    quest_bridge: "Generate a witness verifier with a mutated cell denial test.".to_string(),
-                    concepts: vec!["cell".to_string(), "script".to_string(), "witness".to_string()],
-                },
-                LearningLessonPlan {
-                    title: "Fiber Replay Defense".to_string(),
-                    focus: "Bind invoices and HTLC preimages to reader, content, run, and channel state.".to_string(),
-                    checkpoint_question: "What blocks receipt replay?".to_string(),
-                    correct_answer: "Bind receipt proof to reader, content id, run id, amount, and channel state.".to_string(),
-                    misconception: "Any non-empty preimage proves access.".to_string(),
-                    quest_bridge: "Generate a Fiber receipt verifier with replayed run id tests.".to_string(),
-                    concepts: vec!["invoice".to_string(), "HTLC".to_string(), "channel state".to_string()],
-                },
-                LearningLessonPlan {
-                    title: "Quest Handoff".to_string(),
-                    focus: "Turn the invariant into code, tests, and a boss explanation.".to_string(),
-                    checkpoint_question: "When should a quest unlock?".to_string(),
-                    correct_answer: "After the learner names the invariant and denial test.".to_string(),
-                    misconception: "Compilation proves understanding.".to_string(),
-                    quest_bridge: "Generate a compact verifier quest from the active lesson invariant.".to_string(),
-                    concepts: vec!["invariant".to_string(), "denial test".to_string(), "boss".to_string()],
-                },
-            ],
+        let compact = AiLearningModuleCompact {
+            t: "CKB Fiber JoyID from vibecoded code".to_string(),
+            l: (0..3)
+                .map(|_| AiLearningLessonCompact {
+                    t: "Verify JoyID signature".to_string(),
+                    e: "Backend checks JoyID-signed payload before accepting Fiber channel actions. Bind nonce, domain, and CKB address to prevent replay or phishing.".to_string(),
+                    s: "const ok = await verifyJoyIDSignature({ message, signature, address });".to_string(),
+                    q: "What must the backend verify before trusting a JoyID-authorized Fiber request?".to_string(),
+                    a: "JoyID signature over the exact challenge payload".to_string(),
+                    b: vec!["CSS theme".to_string(), "Gas price chart".to_string(), "Frontend route".to_string()],
+                    ci: 0,
+                })
+                .collect(),
         };
 
-        let module = build_learning_module_from_plan(&request, plan).unwrap();
+        let module = build_learning_module_from_compact_ai(&request, compact).unwrap();
 
         assert_eq!(module.lessons.len(), 3);
-        assert!(module.title.contains("CKB/Fiber"));
+        assert!(
+            module.lessons[0]
+                .explanation
+                .contains("JoyID-signed payload")
+        );
+        assert!(
+            module.lessons[0]
+                .explanation
+                .contains("verifyJoyIDSignature")
+        );
         assert_eq!(module.lessons[0].checkpoint.options.len(), 4);
-        assert_eq!(module.lessons[0].checkpoint.correct_index, 0);
-        assert_eq!(module.lessons[1].checkpoint.correct_index, 1);
-        assert_eq!(module.lessons[2].checkpoint.correct_index, 2);
+        assert!(module.lessons[0].why_it_matters.contains("Backend dev"));
     }
 
     #[test]
